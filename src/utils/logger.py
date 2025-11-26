@@ -1,0 +1,1 @@
+# Zentrale Logging Funktionen für alle anderen Module
