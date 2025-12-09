@@ -1,14 +1,32 @@
-from datetime import datetime
-from pydantic import BaseModel
+# app/models/signal.py
+from sqlalchemy import Column, Integer, String, Float, DateTime, JSON
+from sqlalchemy.sql import func
+from db.database import Base  # dein declarative_base()
+from models.tradingview_signal import TradingviewSignal
 
-# Das Signal vom Trading View Webhook
-class Signal(BaseModel):
-    id: int | None = None # Primärschlüssel. Eindeutige Identifikation in DB
-    external_id: str  # Eindeutige ID vom TradingView Webhook
-    timestamp: datetime # Zeitstempel des Signals für Backtesting,...
-    symbol: str # XAUUSD
-    side: str           # "long" oder "short"
-    timeframe: str      # "15m", "1h", "4h"
-    price: float        # Close-Preis bei Signal
-    raw_payload: dict   # Original TradingView JSON: Vollständiger Payload
-    processed: bool = False # Wurde das Signal bereits verarbeitet?
+
+class Signal(Base):
+    __tablename__ = "signals"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    created_at  = Column(DateTime, server_default=func.now())
+    symbol      = Column(String, index=True)
+    side        = Column(String)
+    timeframe   = Column(String)
+    price       = Column(Float)
+    status      = Column(String, default="new")
+    raw_payload = Column(JSON)
+    source      = Column(String, default="tradingview")
+
+    @classmethod
+    def from_tradingview(cls, tv: TradingviewSignal) -> "Signal":
+        return cls(
+            symbol=tv.symbol,
+            side=tv.side,
+            timeframe=tv.timeframe,
+            price=tv.price,
+            status="new",
+            source="tradingview",
+            raw_payload=tv.model_dump(),
+        )
+

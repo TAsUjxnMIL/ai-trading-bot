@@ -1,0 +1,51 @@
+# ---- OS / Editor ----
+.DS_Store
+*.swp
+*.swo
+
+# VS Code
+.vscode/
+.history/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.pkl
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtualenv / Conda
+.venv/
+venv/
+env/
+.conda/
+.mypy_cache/
+.pytest_cache/
+.cache/
+
+# Jupyter / Reports
+.ipynb_checkpoints/
+
+# ---- Secrets / Config ----
+.env
+.env.*.local
+
+# ---- SQLite / DB ----
+*.db
+*.sqlite
+*.sqlite3
+
+# ---- Logs ----
+logs/
+*.log
+
+# ---- Misc ----
+# Mac Finder
+.AppleDouble
+.Spotlight-V100
+.Trashes

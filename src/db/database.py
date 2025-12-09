@@ -29,77 +29,18 @@ Wieso brauchen wir eine Datenbank?
         - Max. 3 Trades pro Tag...
       """
 
-import sqlite3
-from pathlib import Path
+# src/db.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-DB_PATH = Path(__file__).parent / "bot.db"
+# einfache SQLite-DB im Projektordner
+SQLALCHEMY_DATABASE_URL = "sqlite:///./trading_bot.db"
 
-def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # erlaubt dictionary-ähnliche Rückgaben
-    return conn
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    connect_args={"check_same_thread": False},  # für SQLite + FastAPI
+)
 
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-def init_db():
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    # Tabelle: Signals
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        external_id TEXT,
-        timestamp TEXT,
-        symbol TEXT,
-        side TEXT,
-        timeframe TEXT,
-        price REAL,
-        raw_payload TEXT,
-        processed INTEGER DEFAULT 0
-    );
-    """)
-
-    # Tabelle: Orders
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        signal_id INTEGER,
-        symbol TEXT,
-        side TEXT,
-        size REAL,
-        order_type TEXT,
-        sl REAL,
-        tp REAL,
-        status TEXT,
-        created_at TEXT,
-        broker_order_id TEXT,
-        FOREIGN KEY(signal_id) REFERENCES signals(id)
-    );
-    """)
-
-    # Tabelle: Trades
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id INTEGER,
-        symbol TEXT,
-        side TEXT,
-        size REAL,
-        entry_price REAL,
-        opened_at TEXT,
-        closed_at TEXT,
-        exit_price REAL,
-        pnl REAL,
-        broker_trade_id TEXT,
-        FOREIGN KEY(order_id) REFERENCES orders(id)
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-# Diese Funktion wird einmal beim Start aufgerufen
-if __name__ == "__main__":
-    init_db()
-    print("Database initialized:", DB_PATH)
+Base = declarative_base()
