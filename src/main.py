@@ -46,7 +46,7 @@ async def tradingview_webhook(signal: TradingviewSignal):
 
     # 3) Business Logic: Signal an Bot weitergeben
     try:
-        signal_service.handle_signal(signal)
+        await signal_service.handle_signal(signal)
     except Exception as e:
         logger.error(f"Signal handling error: {e}")
         raise HTTPException(status_code=500, detail="Internal error")

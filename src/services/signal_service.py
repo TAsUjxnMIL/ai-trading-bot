@@ -19,8 +19,9 @@ from utils.logger import logger
 from models.tradingview_signal import TradingviewSignal  # Pydantic
 from models.signal import Signal                  # SQLAlchemy-Model + Session
 from db.database import SessionLocal              # DB-Session
+from . import trade_engine
 
-def handle_signal(tv_signal: TradingviewSignal):
+async def handle_signal(tv_signal: TradingviewSignal):
     """
     1) TradingView-Signal loggen
     2) In DB speichern (als Signal-Entity)
@@ -32,20 +33,18 @@ def handle_signal(tv_signal: TradingviewSignal):
     try:
         # 1) Aus TradingviewSignal ein Signal-DB-Objekt bauen
         db_signal = Signal.from_tradingview(tv_signal)
-
         # 2) Speichern
         db.add(db_signal)
         db.commit()
         db.refresh(db_signal)
-
         logger.info(f"Saved signal in DB with id={db_signal.id}")
-
-        # 3) (Optional) hier direkt deine Trade-Engine rufen:
-        # trade_engine.handle_new_signal(db_signal)
-
     except Exception as e:
         db.rollback()
         logger.error(f"Error while saving signal: {e}")
         raise
     finally:
         db.close()
+
+    # 3) (Optional) hier direkt deine Trade-Engine rufen:
+    await trade_engine.process_signal(tv_signal)
+    
