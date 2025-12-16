@@ -1,111 +1,54 @@
 # src/broker/ig_client.py
 import os
-import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
-from dotenv import load_dotenv
-
-# .env einlesen (liegt z.B. im Projekt-Root)
-load_dotenv()
+from trading_ig.rest import IGService
 
 
 class IGClient:
     """
-    Sehr einfacher IG REST-Client für DEMO.
-    - Loggt sich einmal ein und speichert CST + X-SECURITY-TOKEN + ACCOUNT-ID
-    - Kann Market-Orders mit StopLoss und TakeProfit schicken
-    - Kann später erweitert werden (SL anpassen, Positionen auslesen etc.)
+    IG client using the trading-ig wrapper (IGService).
 
-    Credentials kommen standardmäßig aus .env:
-        IG_API_KEY=...
-        IG_USERNAME=...
-        IG_PASSWORD=...
+    Env vars (recommended):
+      IG_SERVICE_USERNAME
+      IG_SERVICE_PASSWORD
+      IG_SERVICE_API_KEY
+      IG_SERVICE_ACC_TYPE   (DEMO or LIVE) - optional, default DEMO
+      IG_SERVICE_ACC_NUMBER (optional)
     """
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
-        base_url: str = "https://demo-api.ig.com/gateway/deal",
+        api_key: Optional[str] = None,
+        acc_type: Optional[str] = None,      # "DEMO" or "LIVE"
+        acc_number: Optional[str] = None,    # account number/id
     ) -> None:
-        # Wenn nichts übergeben wurde, aus ENV lesen
-        self.api_key = api_key or os.getenv("IG_API_KEY")
-        self.username = username or os.getenv("IG_USERNAME")
-        self.password = password or os.getenv("IG_PASSWORD")
-        self.base_url = base_url.rstrip("/")
+        self.username = username or os.getenv("IG_SERVICE_USERNAME") or os.getenv("IG_USERNAME")
+        self.password = password or os.getenv("IG_SERVICE_PASSWORD") or os.getenv("IG_PASSWORD")
+        self.api_key = api_key or os.getenv("IG_SERVICE_API_KEY") or os.getenv("IG_API_KEY")
+        self.acc_type = (acc_type or os.getenv("IG_SERVICE_ACC_TYPE") or os.getenv("IG_ENV") or "DEMO").upper()
+        self.acc_number = acc_number or os.getenv("IG_SERVICE_ACC_NUMBER")
 
-        if not self.api_key or not self.username or not self.password:
-            raise ValueError(
-                "Missing IG credentials. Please set IG_API_KEY, "
-                "IG_USERNAME and IG_PASSWORD in .env or pass them "
-                "explicitly to IGClient()."
-            )
+        if not self.username or not self.password or not self.api_key:
+            raise ValueError("Missing IG credentials (env or constructor args).")
 
-        self.cst: Optional[str] = None
-        self.xst: Optional[str] = None
-        self.account_id: Optional[str] = None
+        # Create service + login
+        self.ig = IGService(self.username, self.password, self.api_key, self.acc_type)
+        self.ig.create_session()
 
-    # --------------------
-    # intern: Login & Header
-    # --------------------
-    def _login(self) -> None:
-        """Session bei IG erstellen (CST + X-SECURITY-TOKEN + Account ID)."""
-        headers = {
-            "X-IG-API-KEY": self.api_key,
-            "Content-Type": "application/json; charset=UTF-8",
-            "Accept": "application/json; charset=UTF-8",
-            "Version": "2",
-        }
-        data = {
-            "identifier": self.username,
-            "password": self.password,
-        }
-        resp = requests.post(f"{self.base_url}/session", headers=headers, json=data)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"IG login failed: {resp.status_code} {resp.text}"
-            )
+        # Optional: ensure correct active account
+        if self.acc_number:
+            self.ig.switch_account(self.acc_number, default_account=False)
 
-        self.cst = resp.headers["CST"]
-        self.xst = resp.headers["X-SECURITY-TOKEN"]
-        body = resp.json()
-        self.account_id = body["currentAccountId"]
-
-    def _headers(self) -> Dict[str, str]:
-        """Headers für alle weiteren Requests (nach erfolgreichem Login)."""
-        if not (self.cst and self.xst and self.account_id):
-            self._login()
-
-        return {
-            "X-IG-API-KEY": self.api_key,
-            "CST": self.cst,
-            "X-SECURITY-TOKEN": self.xst,
-            "IG-ACCOUNT-ID": self.account_id,
-            "Content-Type": "application/json; charset=UTF-8",
-            "Accept": "application/json; charset=UTF-8",
-            "Version": "2",
-        }
-
-    # --------------------
-    # Symbol-Mapping
-    # --------------------
     @staticmethod
     def _symbol_to_epic(symbol: str) -> str:
-        """
-        Mapping TradingView-Symbol -> IG-EPIC.
-        Hier kannst du später mehr Symbole ergänzen.
-        """
         symbol = symbol.upper()
         if symbol in ("XAUUSD", "OANDA:XAUUSD", "FOREXCOM:XAUUSD"):
-            # Gold CFD bei IG (Demo)
             return "CS.D.GOLD.CFD.IP"
-        # fallback: direkt zurückgeben (falls du mal EPIC direkt reinschreibst)
         return symbol
 
-    # --------------------
-    # Public API
-    # --------------------
     def place_market_order(
         self,
         symbol: str,
@@ -115,67 +58,68 @@ class IGClient:
         stop_loss: Optional[float] = None,
         currency: str = "EUR",
     ) -> Dict[str, Any]:
-        """
-        Market-Order mit optionalem SL und TP eröffnen.
-        side: 'buy' oder 'sell'
-        size: CFD-Größe (z.B. EUR pro Punkt)
-        """
         epic = self._symbol_to_epic(symbol)
-        direction = "BUY" if side.lower() == "buy" else "SELL"
+        direction = "BUY" if side.lower() in ("buy", "long") else "SELL"
 
-        payload: Dict[str, Any] = {
-            "epic": epic,
-            "direction": direction,
-            "size": size,
-            "orderType": "MARKET",
-            "expiry": "DFB",
-            "forceOpen": True,
-            "guaranteedStop": False,
-            "currencyCode": currency,
-        }
-
-        if take_profit is not None:
-            payload["limitLevel"] = float(take_profit)
-        if stop_loss is not None:
-            payload["stopLevel"] = float(stop_loss)
-
-        headers = self._headers()
-        resp = requests.post(
-            f"{self.base_url}/positions/otc",
-            headers=headers,
-            json=payload,
+        return self.ig.create_open_position(
+            currency_code=currency,
+            direction=direction,
+            epic=epic,
+            order_type="MARKET",
+            expiry="DFB",
+            force_open=True,
+            guaranteed_stop=False,
+            size=size,
+            level=None,
+            limit_level=float(take_profit) if take_profit is not None else None,
+            stop_level=float(stop_loss) if stop_loss is not None else None,
+            limit_distance=None,
+            stop_distance=None,
+            quote_id=None,
+            trailing_stop=None,
+            trailing_stop_increment=None,
         )
 
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(
-                f"IG place order failed: {resp.status_code} {resp.text}"
-            )
+    def get_open_positions(self) -> List[Dict[str, Any]]:
+        pos = self.ig.fetch_open_positions()
 
-        return resp.json()
+        # trading-ig often returns a pandas DataFrame
+        if hasattr(pos, "to_dict"):
+            return pos.to_dict(orient="records")
 
-    def update_stop_loss(
-        self,
-        deal_id: str,
-        new_stop: float,
-    ) -> Dict[str, Any]:
-        """
-        Stop Loss einer bestehenden Position anpassen.
-        (Für deinen gestuften Trailing-SL später.)
-        """
-        payload = {
-            "stopLevel": float(new_stop),
-        }
+        if isinstance(pos, list):
+            return pos
 
-        headers = self._headers()
-        resp = requests.put(
-            f"{self.base_url}/positions/otc/{deal_id}",
-            headers=headers,
-            json=payload,
+        return [pos] if isinstance(pos, dict) else []
+
+    def get_current_price(self, symbol: str) -> float:
+        epic = self._symbol_to_epic(symbol)
+        market = self.ig.fetch_market_by_epic(epic)
+
+        # market can be dict-like or object-like depending on wrapper version
+        snapshot = market.get("snapshot") if hasattr(market, "get") else getattr(market, "snapshot", None)
+        if snapshot is None:
+            raise RuntimeError(f"Market snapshot missing: {market}")
+
+        bid = snapshot.get("bid") if hasattr(snapshot, "get") else getattr(snapshot, "bid", None)
+        offer = snapshot.get("offer") if hasattr(snapshot, "get") else getattr(snapshot, "offer", None)
+
+        if bid is None and offer is None:
+            raise RuntimeError(f"Missing bid/offer in snapshot: {snapshot}")
+
+        if bid is None:
+            return float(offer)
+        if offer is None:
+            return float(bid)
+        return (float(bid) + float(offer)) / 2.0
+
+    def update_stop_loss(self, deal_id: str, new_stop: float) -> Dict[str, Any]:
+    # IGService has update_open_position in your installation
+        return self.ig.update_open_position(
+            deal_id=deal_id,
+            stop_level=float(new_stop),
+            # optional extras if you ever need them:
+            # limit_level=None,
+            # trailing_stop=None,
+            # trailing_stop_increment=None,
         )
-
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(
-                f"IG update SL failed: {resp.status_code} {resp.text}"
-            )
-
-        return resp.json()
