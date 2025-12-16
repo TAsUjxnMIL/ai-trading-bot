@@ -1,11 +1,14 @@
 # src/services/trade_engine.py
 
 from math import floor
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from utils.logger import logger
 from broker import broker_client
 from models.tradingview_signal import TradingviewSignal
+
+from services.trade_repo import add_open_trade  # NEW
+
 
 # ──────────────────────────────
 # Konfiguration – analog zu deinem Pine-Strategy-Skript
@@ -33,7 +36,7 @@ def compute_step_sl_long(
     step_size: float = STEP_SIZE_POINTS,
 ) -> float:
     """
-    Long-Variante der gestuften SL-Logik wie in deinem Pine-Skript:
+    Long-Variante der gestuften SL-Logik wie in deinem Pine-Skript.
 
     distFromEntry = current - entry
     steps = max(floor(distFromEntry / stepDist), 0)
@@ -43,8 +46,7 @@ def compute_step_sl_long(
     dist_from_entry = current_price - entry_price
     steps = max(floor(dist_from_entry / step_dist), 0)
     sl = entry_price - sl_base + steps * step_size
-    # Sicherheitsregel: SL nie über aktuellen Kurs
-    sl = min(sl, current_price)
+    sl = min(sl, current_price)  # SL nie über aktuellen Kurs
     return sl
 
 
@@ -56,7 +58,7 @@ def compute_step_sl_short(
     step_size: float = STEP_SIZE_POINTS,
 ) -> float:
     """
-    Short-Variante der gestuften SL-Logik:
+    Short-Variante der gestuften SL-Logik.
 
     distFromEntryShort = entry - current
     steps = max(floor(distFromEntryShort / stepDist), 0)
@@ -66,9 +68,26 @@ def compute_step_sl_short(
     dist_from_entry = entry_price - current_price
     steps = max(floor(dist_from_entry / step_dist), 0)
     sl = entry_price + sl_base - steps * step_size
-    # Sicherheitsregel: SL nie unter aktuellen Kurs (bei Short)
-    sl = max(sl, current_price)
+    sl = max(sl, current_price)  # SL nie unter aktuellen Kurs
     return sl
+
+
+def _extract_deal_id(order_response: Any) -> Optional[str]:
+    """
+    Extract dealId from the trading-ig confirm response.
+
+    Usually /confirms/{deal_reference} returns a dict containing 'dealId'.
+    We still handle a few possible shapes defensively.
+    """
+    if not isinstance(order_response, dict):
+        return None
+
+    return (
+        order_response.get("dealId")
+        or order_response.get("deal_id")
+        or (order_response.get("deal") or {}).get("dealId")
+        or (order_response.get("position") or {}).get("dealId")
+    )
 
 
 # ──────────────────────────────
@@ -79,35 +98,27 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
     """
     TradingView-Webhook → Bot-Logik → Order bei IG.
 
-    Aktuelle Strategie:
-    - TradingView berechnet NUR die Entry-Bedingungen (Supertrend, EMA, ADX, Volumen, VWAP).
-    - Wenn ein neues Signal kommt (long/short):
-        * Wir eröffnen EINE Market-Position mit:
-          - Take Profit = entry ± TP_POINTS
-          - Stop Loss  = gestufter SL, initial noch in Stufe 0 (wie im Pine-Strategy-Skript)
-    - Das spätere Nachziehen des SL in Stufen läuft über compute_step_sl_* und
-      muss in einem separaten Update-Mechanismus eingebaut werden.
+    Strategie:
+    - TradingView sendet Entry (long/short + price)
+    - Bot eröffnet Market Position mit TP/initial SL (Stufe 0)
+    - dealId wird gespeichert, damit SLManager NUR Bot-Trades trailt
     """
     logger.info(f"[TRADE_ENGINE] processing signal: {tv_signal}")
 
-    symbol = tv_signal.symbol           # z.B. "XAUUSD"
-    side_raw = tv_signal.side.lower()   # "long" oder "short"
-    entry_price = tv_signal.price       # Preis aus TradingView beim Signal
+    symbol = tv_signal.symbol
+    side_raw = tv_signal.side.lower()
+    entry_price = tv_signal.price
 
-    # Sanity Check
     if side_raw not in ("long", "short"):
         logger.warning(f"[TRADE_ENGINE] Unknown side in signal: {side_raw}")
         return
 
     is_long = side_raw == "long"
-    side = "buy" if is_long else "sell"     # für IG: BUY/SELL → wir mappen auf "buy"/"sell"
+    side = "buy" if is_long else "sell"
 
-    # ──────────────────────────────
-    # TP & initialer SL wie im Strategy-Skript
-    # ──────────────────────────────
+    # TP & initialer SL (Stufe 0)
     if is_long:
         tp_price = entry_price + TP_POINTS
-        # initial: current_price = entry_price → Stufe 0
         sl_price = compute_step_sl_long(entry_price, entry_price)
     else:
         tp_price = entry_price - TP_POINTS
@@ -118,18 +129,31 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
         f"TP={tp_price}, initial SL={sl_price}, qty={POSITION_SIZE}"
     )
 
-    # ──────────────────────────────
-    # Order bei IG über broker_client
-    # ──────────────────────────────
     try:
-        order_response = await broker_client.place_market_order(
+        order_response: Dict[str, Any] = await broker_client.place_market_order(
             symbol=symbol,
-            side=side,                   # "buy" oder "sell"
-            size=POSITION_SIZE,          # CFD-Größe
-            order_type="market",
-            take_profit=tp_price,        # geht als limitLevel an IG
-            stop_loss=sl_price,          # geht als stopLevel an IG
+            side=side,
+            size=POSITION_SIZE,
+            take_profit=tp_price,
+            stop_loss=sl_price,
         )
         logger.info(f"[TRADE_ENGINE] order response: {order_response}")
+
+        deal_id = _extract_deal_id(order_response)
+        if not deal_id:
+            raise RuntimeError(f"No dealId in IG order response: {order_response}")
+
+        # Persist bot-managed trade (so SLManager can filter safely)
+        add_open_trade(
+            deal_id=str(deal_id),
+            symbol=symbol,
+            side=side_raw,            # "long"/"short"
+            entry_price=float(entry_price),
+            tp_price=float(tp_price),
+            initial_sl=float(sl_price),
+        )
+
+        logger.info(f"[TRADE_ENGINE] stored bot trade deal_id={deal_id}")
+
     except Exception as e:
         logger.exception(f"[TRADE_ENGINE] error while placing order: {e}")
