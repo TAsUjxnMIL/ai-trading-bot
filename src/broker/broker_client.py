@@ -1,95 +1,126 @@
 # src/broker/broker_client.py
-
 import asyncio
+import os
 from typing import Optional, Dict, Any, List
 
-from config.settings import BROKER_MODE
 from utils.logger import logger
-
 from .dummy import DummyBroker
-from .oanda import OandaBroker
+# from .oanda import OandaBroker
 from .ig_client import IGClient
 
-# -------------------------------------------------
-# Einen konkreten Broker auswählen (Factory)
-# -------------------------------------------------
+BROKER_MODE = os.getenv("BROKER_MODE", "dummy").strip().lower()
 
-if BROKER_MODE == "dummy":
-    logger.info("[BROKER] Using DummyBroker")
-    _client = DummyBroker()
-
-elif BROKER_MODE == "oanda":
-    logger.info("[BROKER] Using OandaBroker")
-    _client = OandaBroker()
-
-elif BROKER_MODE == "real":
-    logger.info("[BROKER] Using IGClient (REAL / PRACTICE je nach IG_ENV)")
-    _client = IGClient()
-
-else:
-    raise ValueError(f"Unknown BROKER_MODE={BROKER_MODE!r}")
+_client = None
+_init_lock = asyncio.Lock()
 
 
 def _is_coro(fn) -> bool:
-    """Hilfsfunktion: ist die Client-Methode async oder sync?"""
+    """True if fn is async def coroutine function."""
     return asyncio.iscoroutinefunction(fn)
 
 
+def _create_client_sync():
+    """
+    Create the underlying broker client (SYNC).
+    Runs inside a thread via asyncio.to_thread so we never block the event loop.
+    """
+    global _client
+
+    if BROKER_MODE == "dummy":
+        logger.info("[BROKER] Using DummyBroker")
+        return DummyBroker()
+
+    if BROKER_MODE == "oanda":
+        logger.info("[BROKER] Using OandaBroker")
+        # return OandaBroker()
+        raise NotImplementedError("OandaBroker not wired yet")
+
+    if BROKER_MODE == "ig":
+        logger.info("[BROKER] Using IGClient (REAL / PRACTICE je nach IG_ENV)")
+        return IGClient()
+
+    raise ValueError(f"Unknown BROKER_MODE={BROKER_MODE!r}")
+
+
+async def _get_client():
+    """
+    Lazily create and cache the broker client exactly once (even under concurrency).
+    """
+    global _client
+    if _client is not None:
+        return _client
+
+    async with _init_lock:
+        if _client is not None:
+            return _client
+
+        # Create in a thread to avoid blocking event loop
+        _client = await asyncio.to_thread(_create_client_sync)
+        return _client
+
+
 # -------------------------------------------------
-# Öffentliche async-API, die dein Bot verwendet
+# Public async API used by the bot
 # -------------------------------------------------
 
 async def place_market_order(
     symbol: str,
-    side: str,        # "buy" oder "sell"
+    side: str,
     size: float,
     take_profit: Optional[float] = None,
     stop_loss: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Allgemeine Market-Order-Funktion.
-    Ruft intern _client.place_market_order(...) auf.
-    """
-    fn = getattr(_client, "place_market_order")
+    client = await _get_client()
+    fn = getattr(client, "place_market_order")
 
     if _is_coro(fn):
         return await fn(symbol, side, size, take_profit, stop_loss)
-    else:
-        return await asyncio.to_thread(
-            fn,
-            symbol,
-            side,
-            size,
-            take_profit,
-            stop_loss,
-        )
+
+    return await asyncio.to_thread(fn, symbol, side, size, take_profit, stop_loss)
 
 
-async def update_stop_loss(
-    deal_id: str,
-    new_stop: float,
-) -> Dict[str, Any]:
-    fn = getattr(_client, "update_stop_loss")
+async def update_stop_loss(deal_id: str, new_stop: float) -> Dict[str, Any]:
+    client = await _get_client()
+    fn = getattr(client, "update_stop_loss")
 
     if _is_coro(fn):
         return await fn(deal_id, new_stop)
-    else:
-        return await asyncio.to_thread(fn, deal_id, new_stop)
+
+    return await asyncio.to_thread(fn, deal_id, new_stop)
 
 
 async def get_current_price(symbol: str) -> float:
-    fn = getattr(_client, "get_current_price")
+    client = await _get_client()
+    fn = getattr(client, "get_current_price")
 
     if _is_coro(fn):
         return await fn(symbol)
-    else:
-        return await asyncio.to_thread(fn, symbol)
+
+    return await asyncio.to_thread(fn, symbol)
 
 
 async def get_open_positions() -> List[Dict[str, Any]]:
-    fn = getattr(_client, "get_open_positions")
+    client = await _get_client()
+    fn = getattr(client, "get_open_positions")
 
     if _is_coro(fn):
         return await fn()
-    else:
-        return await asyncio.to_thread(fn)
+
+    return await asyncio.to_thread(fn)
+
+
+# Optional: call from FastAPI shutdown if you later add close() on clients.
+async def shutdown():
+    global _client
+    if _client is None:
+        return
+
+    # if your IGClient ever implements close(), call it here
+    close_fn = getattr(_client, "close", None)
+    if close_fn:
+        if _is_coro(close_fn):
+            await close_fn()
+        else:
+            await asyncio.to_thread(close_fn)
+
+    _client = None
