@@ -1,27 +1,31 @@
-# Wir empfangen Webhook Anfragen von Trading View
-# JSON Check -> Authentification passt? 
-# JA ? JSON -> Business Logic / Trading Bot
-"""
-Verbindungen:
-importiert config.py → um z. B. das Secret oder ENV zu kennen
-importiert auth.py → prüft, ob der Request gültig ist
-importiert signal_service.py → gibt den validierten Payload weiter
-nutzt logger.py → loggt Requests/Fehler
-"""
-
 # src/main.py
-from fastapi import FastAPI, APIRouter, HTTPException
-from dotenv import load_dotenv
-load_dotenv()
 
+# Loading env variables from .env
+from pathlib import Path
+from dotenv import load_dotenv
+ENV_PATH = Path(__file__).resolve().parents[1] / ".env"  # trading-bot/.env
+load_dotenv(dotenv_path=ENV_PATH, override=False)  # loading with explicit path for clarity
+import os
+print("BROKER_MODE =", os.getenv("BROKER_MODE"))
+print("IG_SERVICE_USERNAME =", os.getenv("IG_SERVICE_USERNAME"))
+
+from fastapi import FastAPI, APIRouter, HTTPException
+import uvicorn
 from utils import auth
 from utils.logger import logger
 from services import signal_service
 from models.tradingview_signal import TradingviewSignal
-import uvicorn
+from models.bot_trade import BotTrade
 from db.database import Base, engine
+from services.sl_manager import SLManager
 
 router = APIRouter()
+
+# ----------------------------
+# SL Manager (Background Task)
+# ----------------------------
+sl_manager = SLManager()
+
 
 @router.post("/webhook/tradingview")
 async def tradingview_webhook(signal: TradingviewSignal):
@@ -37,7 +41,6 @@ async def tradingview_webhook(signal: TradingviewSignal):
         payload = signal.model_dump()
         auth.verify(payload)
     except HTTPException as e:
-        # kommt direkt von auth.verify
         logger.error(f"Auth error: {e.detail}")
         raise
     except Exception as e:
@@ -54,14 +57,31 @@ async def tradingview_webhook(signal: TradingviewSignal):
     # 4) Antwort an TradingView
     return {"status": "ok"}
 
-# FastAPI-App erstellen und Router einhängen
+
+# ----------------------------
+# FastAPI App
+# ----------------------------
 app = FastAPI()
 app.include_router(router)
 
 # DB-Tabellen erstellen (falls nicht existieren)
 Base.metadata.create_all(bind=engine)
 
+
+# ----------------------------
+# Startup / Shutdown Hooks
+# ----------------------------
+@app.on_event("startup")
+async def on_startup():
+    logger.info("[APP] startup: starting SLManager")
+    sl_manager.start()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    logger.info("[APP] shutdown: stopping SLManager")
+    await sl_manager.stop()
+
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
