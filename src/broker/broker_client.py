@@ -79,14 +79,14 @@ async def place_market_order(
     return await asyncio.to_thread(fn, symbol, side, size, take_profit, stop_loss)
 
 
-async def update_stop_loss(deal_id: str, new_stop: float) -> Dict[str, Any]:
+async def update_stop_loss(deal_id: str, new_stop: float, take_profit: Optional[float] = None) -> Dict[str, Any]:
     client = await _get_client()
     fn = getattr(client, "update_stop_loss")
 
     if _is_coro(fn):
-        return await fn(deal_id, new_stop)
+        return await fn(deal_id, new_stop, take_profit)
 
-    return await asyncio.to_thread(fn, deal_id, new_stop)
+    return await asyncio.to_thread(fn, deal_id, new_stop, take_profit)
 
 
 async def get_current_price(symbol: str) -> float:
@@ -124,3 +124,10 @@ async def shutdown():
             await asyncio.to_thread(close_fn)
 
     _client = None
+
+async def get_bid_offer(symbol: str):
+    client = await _get_client()
+    fn = getattr(client, "get_bid_offer")
+    if _is_coro(fn):
+        return await fn(symbol)
+    return await asyncio.to_thread(fn, symbol)
