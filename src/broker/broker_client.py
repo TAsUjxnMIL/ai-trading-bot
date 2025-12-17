@@ -4,7 +4,7 @@ import os
 from typing import Optional, Dict, Any, List
 
 from utils.logger import logger
-from .dummy import DummyBroker
+#from .dummy import DummyBroker
 # from .oanda import OandaBroker
 from .ig_client import IGClient
 
@@ -26,6 +26,7 @@ def _create_client_sync():
     """
     global _client
 
+    """
     if BROKER_MODE == "dummy":
         logger.info("[BROKER] Using DummyBroker")
         return DummyBroker()
@@ -34,6 +35,7 @@ def _create_client_sync():
         logger.info("[BROKER] Using OandaBroker")
         # return OandaBroker()
         raise NotImplementedError("OandaBroker not wired yet")
+    """
 
     if BROKER_MODE == "ig":
         logger.info("[BROKER] Using IGClient (REAL / PRACTICE je nach IG_ENV)")
