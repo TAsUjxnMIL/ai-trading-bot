@@ -6,7 +6,6 @@ from typing import Optional, Dict, Any
 from utils.logger import logger
 from broker import broker_client
 from models.tradingview_signal import TradingviewSignal
-
 from services.trade_repo import add_open_trade  # NEW
 
 
@@ -21,7 +20,7 @@ STEP_DIST_POINTS: float = 5.0    # alle +5$ Gewinn → eine "Stufe"
 STEP_SIZE_POINTS: float = 1.0    # pro Stufe rückt SL um 1$ Richtung Entry
 
 # CFD-Größe pro Trade (je nach Risiko / Konto anpassen)
-POSITION_SIZE: float = 0.5       # z.B. 0.5 €/Punkt – bitte anpassen
+POSITION_SIZE: float = 2       # z.B. 0.5 €/Punkt – bitte anpassen
 
 
 # ──────────────────────────────
@@ -46,7 +45,7 @@ def compute_step_sl_long(
     dist_from_entry = current_price - entry_price
     steps = max(floor(dist_from_entry / step_dist), 0)
     sl = entry_price - sl_base + steps * step_size
-    sl = min(sl, current_price)  # SL nie über aktuellen Kurs
+    sl = min(sl, current_price)
     return sl
 
 
@@ -68,7 +67,7 @@ def compute_step_sl_short(
     dist_from_entry = entry_price - current_price
     steps = max(floor(dist_from_entry / step_dist), 0)
     sl = entry_price + sl_base - steps * step_size
-    sl = max(sl, current_price)  # SL nie unter aktuellen Kurs
+    sl = max(sl, current_price)
     return sl
 
 
@@ -81,7 +80,6 @@ def _extract_deal_id(order_response: Any) -> Optional[str]:
     """
     if not isinstance(order_response, dict):
         return None
-
     return (
         order_response.get("dealId")
         or order_response.get("deal_id")
@@ -90,9 +88,15 @@ def _extract_deal_id(order_response: Any) -> Optional[str]:
     )
 
 
-# ──────────────────────────────
-# Haupteinstieg: wird vom Webhook-Service aufgerufen
-# ──────────────────────────────
+def _extract_fill_level(order_response: Any) -> Optional[float]:
+    if not isinstance(order_response, dict):
+        return None
+    lvl = order_response.get("level") #or order_response.get("openLevel") or order_response.get("open_level")
+    try:
+        return float(lvl) if lvl is not None else None
+    except Exception:
+        return None
+
 
 async def process_signal(tv_signal: TradingviewSignal) -> None:
     """
@@ -107,7 +111,6 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
 
     symbol = tv_signal.symbol
     side_raw = tv_signal.side.lower()
-    entry_price = tv_signal.price
 
     if side_raw not in ("long", "short"):
         logger.warning(f"[TRADE_ENGINE] Unknown side in signal: {side_raw}")
@@ -116,17 +119,25 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
     is_long = side_raw == "long"
     side = "buy" if is_long else "sell"
 
-    # TP & initialer SL (Stufe 0)
+    try:
+        bid, offer = await broker_client.get_bid_offer(symbol)
+    except Exception as e:
+        logger.exception(f"[TRADE_ENGINE] could not fetch bid/offer from broker: {e}")
+        return
+
+    entry_ref = offer if is_long else bid  # LONG -> offer, SHORT -> bid
+
+    # TP & initialer SL (Stufe 0) — jetzt konsistent zur Broker-Preiswelt
     if is_long:
-        tp_price = entry_price + TP_POINTS
-        sl_price = compute_step_sl_long(entry_price, entry_price)
+        tp_price = entry_ref + TP_POINTS
+        sl_price = compute_step_sl_long(entry_ref, entry_ref)
     else:
-        tp_price = entry_price - TP_POINTS
-        sl_price = compute_step_sl_short(entry_price, entry_price)
+        tp_price = entry_ref - TP_POINTS
+        sl_price = compute_step_sl_short(entry_ref, entry_ref)
 
     logger.info(
-        f"[TRADE_ENGINE] side={side_raw}, entry={entry_price}, "
-        f"TP={tp_price}, initial SL={sl_price}, qty={POSITION_SIZE}"
+        f"[TRADE_ENGINE] TV price={tv_signal.price} | IG bid={bid:.2f} offer={offer:.2f} | "
+        f"entry_ref={entry_ref:.2f} side={side_raw} TP={tp_price:.2f} SL0={sl_price:.2f} size={POSITION_SIZE}"
     )
 
     try:
@@ -143,17 +154,20 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
         if not deal_id:
             raise RuntimeError(f"No dealId in IG order response: {order_response}")
 
-        # Persist bot-managed trade (so SLManager can filter safely)
+        fill_level = _extract_fill_level(order_response)
+        stored_entry = fill_level if fill_level is not None else entry_ref
+
+        # Persist bot-managed trade (store REAL broker entry if we have it)
         add_open_trade(
             deal_id=str(deal_id),
             symbol=symbol,
-            side=side_raw,            # "long"/"short"
-            entry_price=float(entry_price),
+            side=side_raw,
+            entry_price=float(stored_entry),
             tp_price=float(tp_price),
             initial_sl=float(sl_price),
         )
 
-        logger.info(f"[TRADE_ENGINE] stored bot trade deal_id={deal_id}")
+        logger.info(f"[TRADE_ENGINE] stored bot trade deal_id={deal_id} entry={stored_entry:.2f}")
 
     except Exception as e:
         logger.exception(f"[TRADE_ENGINE] error while placing order: {e}")
