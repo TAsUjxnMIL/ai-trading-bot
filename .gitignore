@@ -49,3 +49,4 @@ logs/
 .AppleDouble
 .Spotlight-V100
 .Trashes
+.env
