@@ -2,16 +2,24 @@
 
 import asyncio
 from typing import Dict, Any, List, Optional, Set
-
+import math
 from utils.logger import logger
 from broker import broker_client
 from services.trade_engine import compute_step_sl_long, compute_step_sl_short
 from services.trade_repo import get_open_bot_deal_ids
 
-POLL_SECONDS = 1.5          # how often to poll
+POLL_SECONDS = 5          # how often to poll
 MIN_SL_MOVE = 0.10          # only update if SL changes by at least this amount
 ERROR_BACKOFF = 5.0         # backoff on errors
 
+def _opt_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(v) else v
 
 def _extract_position_fields(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
@@ -30,9 +38,10 @@ def _extract_position_fields(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(pos, dict):
         return None
 
-    deal_id = pos.get("dealId") or pos.get("deal_id")
-    symbol = pos.get("epic") or pos.get("symbol")
-    entry = pos.get("level") or pos.get("openLevel") or pos.get("entry_price")
+    deal_id = pos.get("dealId") #or pos.get("deal_id")
+    symbol = pos.get("epic") #or pos.get("symbol")
+    entry = pos.get("level") #or pos.get("openLevel") or pos.get("entry_price")
+    limit_level = pos.get("limitLevel")  # take profit
 
     direction = (pos.get("direction") or "").upper()
     if direction == "BUY":
@@ -42,17 +51,21 @@ def _extract_position_fields(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     else:
         side = pos.get("side")  # fallback if already normalized
 
-    stop = pos.get("stopLevel") or pos.get("stop_loss") or pos.get("stop")
+    stop = pos.get("stopLevel") #or pos.get("stop_loss") or pos.get("stop")
 
     if not deal_id or not symbol or entry is None or side not in ("long", "short"):
         return None
 
+    stop = _opt_float(pos.get("stopLevel"))
+    limit_level = _opt_float(pos.get("limitLevel"))
+    
     return {
         "deal_id": str(deal_id),
         "symbol": str(symbol),  # epic
         "side": side,
         "entry_price": float(entry),
-        "stop_loss": float(stop) if stop is not None else None,
+        "stop_loss": stop,
+        "take_profit": limit_level
     }
 
 
@@ -131,6 +144,7 @@ class SLManager:
             symbol = pos["symbol"]      # epic
             side = pos["side"]
             entry = pos["entry_price"]
+            take_profit = pos["take_profit"]
 
             if symbol not in price_cache:
                 price_cache[symbol] = await broker_client.get_current_price(symbol)
@@ -152,7 +166,7 @@ class SLManager:
                     f"[SL_MANAGER] initial SL set deal={deal_id} {symbol} {side}: "
                     f"-> {new_sl:.2f} (px={current_price:.2f}, entry={entry:.2f})"
                 )
-                await broker_client.update_stop_loss(deal_id, new_sl)
+                await broker_client.update_stop_loss(deal_id, new_sl, take_profit)
                 self._last_sl_by_deal[deal_id] = new_sl
                 continue
 
@@ -171,5 +185,5 @@ class SLManager:
                 f"{ref_sl:.2f} -> {new_sl:.2f} (px={current_price:.2f}, entry={entry:.2f})"
             )
 
-            await broker_client.update_stop_loss(deal_id, new_sl)
+            await broker_client.update_stop_loss(deal_id, new_sl, take_profit)
             self._last_sl_by_deal[deal_id] = new_sl
