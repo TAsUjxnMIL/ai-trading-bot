@@ -1,4 +1,4 @@
-# src/schemas/tradingview.py
+# src/models/tradingview_signal.py
 from pydantic import BaseModel
 from typing import Literal
 

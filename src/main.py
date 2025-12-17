@@ -5,9 +5,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"  # trading-bot/.env
 load_dotenv(dotenv_path=ENV_PATH, override=False)  # loading with explicit path for clarity
-import os
-print("BROKER_MODE =", os.getenv("BROKER_MODE"))
-print("IG_SERVICE_USERNAME =", os.getenv("IG_SERVICE_USERNAME"))
 
 from fastapi import FastAPI, APIRouter, HTTPException
 import uvicorn
@@ -15,6 +12,7 @@ from utils import auth
 from utils.logger import logger
 from services import signal_service
 from models.tradingview_signal import TradingviewSignal
+from models.signal import Signal
 from models.bot_trade import BotTrade
 from db.database import Base, engine
 from services.sl_manager import SLManager
