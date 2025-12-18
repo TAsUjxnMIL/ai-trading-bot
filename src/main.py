@@ -15,14 +15,14 @@ from models.tradingview_signal import TradingviewSignal
 from models.signal import Signal
 from models.bot_trade import BotTrade
 from db.database import Base, engine
-from services.sl_manager import SLManager
+from services.trade_lifecycle_mgr import TradeLifeCycleManager
 
 router = APIRouter()
 
 # ----------------------------
-# SL Manager (Background Task)
+# TradeLifeCycleManager (Background Task)
 # ----------------------------
-sl_manager = SLManager()
+trade_lifecycle_manager = TradeLifeCycleManager()
 
 
 @router.post("/webhook/tradingview")
@@ -71,14 +71,14 @@ Base.metadata.create_all(bind=engine)
 # ----------------------------
 @app.on_event("startup")
 async def on_startup():
-    logger.info("[APP] startup: starting SLManager")
-    sl_manager.start()
+    logger.info("[APP] startup: starting TradeLifeCycleManager")
+    trade_lifecycle_manager.start()
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    logger.info("[APP] shutdown: stopping SLManager")
-    await sl_manager.stop()
+    logger.info("[APP] shutdown: stopping TradeLifeCycleManager")
+    await trade_lifecycle_manager.stop()
 
 
 if __name__ == "__main__":

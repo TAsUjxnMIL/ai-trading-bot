@@ -1,30 +1,49 @@
 # src/services/trade_engine.py
 
 from math import floor
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+import uuid
+import math
 
 from utils.logger import logger
 from broker import broker_client
 from models.tradingview_signal import TradingviewSignal
-from services.trade_repo import add_open_trade  # NEW
+
+from services.trade_repo import (
+    add_open_trade,
+    create_trade_group,
+    has_active_trade_group,
+)
 
 
 # ──────────────────────────────
-# Konfiguration – analog zu deinem Pine-Strategy-Skript
-# Werte in XAUUSD-Dollar (nicht in Pips)
+# Konfiguration – XAUUSD-Dollar (nicht Pips)
 # ──────────────────────────────
 
-TP_POINTS: float        = 36.0   # Take Profit Abstand (z.B. +36$ über Entry bei Long)
-SL_BASE_POINTS: float   = 3.5    # initialer SL-Abstand (z.B. -3.5$ unter Entry bei Long)
-STEP_DIST_POINTS: float = 5.0    # alle +5$ Gewinn → eine "Stufe"
-STEP_SIZE_POINTS: float = 1.0    # pro Stufe rückt SL um 1$ Richtung Entry
+# 3-Take-Profit Ladder
+TP_LEVELS_POINTS: List[float] = [3.0, 6.0, 9.0]
 
-# CFD-Größe pro Trade (je nach Risiko / Konto anpassen)
-POSITION_SIZE: float = 2       # z.B. 0.5 €/Punkt – bitte anpassen
+# Initialer Stop (fixer Abstand)
+SL_INITIAL_POINTS: float = 10.0
+
+# Step-Trailing Parameter (wird vom TradeLifeCycleManager genutzt)
+SL_BASE_POINTS: float = 10.0
+STEP_DIST_POINTS: float = 5.0
+STEP_SIZE_POINTS: float = 1.0
+
+# ✅ Gesamtgröße pro Signal (TradeGroup)
+TOTAL_POSITION_SIZE: float = 2.0
+
+# ✅ Size-Regeln für dein GOLD-Instrument laut Log:
+# minDealSize=0.1 → typischerweise 0.1 Schritte
+SIZE_STEP: float = 0.1
+MIN_DEAL_SIZE: float = 0.1
+
+NUM_ORDERS: int = 3
 
 
 # ──────────────────────────────
-# Hilfsfunktionen: Step-SL Berechnung
+# Hilfsfunktionen: Step-SL Berechnung (für TradeLifeCycleManager)
 # ──────────────────────────────
 
 def compute_step_sl_long(
@@ -91,11 +110,66 @@ def _extract_deal_id(order_response: Any) -> Optional[str]:
 def _extract_fill_level(order_response: Any) -> Optional[float]:
     if not isinstance(order_response, dict):
         return None
-    lvl = order_response.get("level") #or order_response.get("openLevel") or order_response.get("open_level")
+    lvl = order_response.get("level")
     try:
         return float(lvl) if lvl is not None else None
     except Exception:
         return None
+
+
+def _round_down_to_step(x: float, step: float) -> float:
+    return math.floor(x / step) * step
+
+
+def split_total_size(
+    total: float,
+    n: int,
+    step: float,
+    min_size: float,
+) -> List[float]:
+    if n <= 0:
+        raise ValueError("n must be > 0")
+    if step <= 0:
+        raise ValueError("step must be > 0")
+    if total <= 0:
+        raise ValueError("total must be > 0")
+
+    min_total = n * min_size
+    if total + 1e-9 < min_total:
+        raise ValueError(
+            f"TOTAL_POSITION_SIZE={total} is too small for {n} orders with minDealSize={min_size}. "
+            f"Need at least {min_total}."
+        )
+
+    raw = total / n
+    base = _round_down_to_step(raw, step)
+    base = max(base, min_size)
+
+    sizes = [base] * n
+    remaining = round(total - sum(sizes), 10)
+
+    i = 0
+    while remaining >= (step - 1e-9):
+        idx = i % n
+        sizes[idx] = round(sizes[idx] + step, 10)
+        remaining = round(total - sum(sizes), 10)
+        i += 1
+        if i > 100000:
+            raise RuntimeError("split_total_size: too many iterations (unexpected).")
+
+    sizes = [round(s, 10) for s in sizes]
+
+    for s in sizes:
+        if s + 1e-9 < min_size:
+            raise RuntimeError(f"Computed size {s} < min_size {min_size}")
+        q = s / step
+        if abs(q - round(q)) > 1e-6:
+            raise RuntimeError(f"Computed size {s} is not a multiple of step {step}")
+
+    if abs(sum(sizes) - total) > 1e-6:
+        raise RuntimeError(f"Size split mismatch: sum(sizes)={sum(sizes)} != total={total}")
+
+    return sizes
 
 
 async def process_signal(tv_signal: TradingviewSignal) -> None:
@@ -116,58 +190,107 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
         logger.warning(f"[TRADE_ENGINE] Unknown side in signal: {side_raw}")
         return
 
+    # ✅ ENTRY-BLOCKER: keine neue TradeGroup wenn OPEN/PARTIAL existiert
+    if has_active_trade_group(symbol):
+        logger.info(
+            f"[TRADE_ENGINE] skipping signal for {symbol}: active trade group (OPEN/PARTIAL) exists"
+        )
+        return
+
     is_long = side_raw == "long"
     side = "buy" if is_long else "sell"
 
+    # 1) aktuellen Bid/Offer holen
     try:
         bid, offer = await broker_client.get_bid_offer(symbol)
     except Exception as e:
         logger.exception(f"[TRADE_ENGINE] could not fetch bid/offer from broker: {e}")
         return
 
-    entry_ref = offer if is_long else bid  # LONG -> offer, SHORT -> bid
+    # 2) Entry-Referenz (Long -> Offer, Short -> Bid)
+    entry_ref = offer if is_long else bid
 
-    # TP & initialer SL (Stufe 0) — jetzt konsistent zur Broker-Preiswelt
-    if is_long:
-        tp_price = entry_ref + TP_POINTS
-        sl_price = compute_step_sl_long(entry_ref, entry_ref)
-    else:
-        tp_price = entry_ref - TP_POINTS
-        sl_price = compute_step_sl_short(entry_ref, entry_ref)
+    # 3) Initialer SL als fixer Abstand (10$)
+    sl_price = (entry_ref - SL_INITIAL_POINTS) if is_long else (entry_ref + SL_INITIAL_POINTS)
+
+    # ✅ TradeGroup-ID für diese Trade-Idee (pro Signal neu)
+    trade_group_id = str(uuid.uuid4())
+
+    # ✅ Dynamische Sizes berechnen (robust, step/min enforced)
+    try:
+        sizes = split_total_size(
+            total=TOTAL_POSITION_SIZE,
+            n=NUM_ORDERS,
+            step=SIZE_STEP,
+            min_size=MIN_DEAL_SIZE,
+        )
+    except Exception as e:
+        logger.exception(f"[TRADE_ENGINE] could not split total size: {e}")
+        return
 
     logger.info(
-        f"[TRADE_ENGINE] TV price={tv_signal.price} | IG bid={bid:.2f} offer={offer:.2f} | "
-        f"entry_ref={entry_ref:.2f} side={side_raw} TP={tp_price:.2f} SL0={sl_price:.2f} size={POSITION_SIZE}"
+        f"[TRADE_ENGINE] group={trade_group_id} | TV price={tv_signal.price} | "
+        f"IG bid={bid:.2f} offer={offer:.2f} | entry_ref={entry_ref:.2f} side={side_raw} "
+        f"SL0={sl_price:.2f} total_size={TOTAL_POSITION_SIZE} sizes={sizes}"
     )
 
+    # ✅ 4) TradeGroup in DB anlegen (einmal)
     try:
-        order_response: Dict[str, Any] = await broker_client.place_market_order(
-            symbol=symbol,
-            side=side,
-            size=POSITION_SIZE,
-            take_profit=tp_price,
-            stop_loss=sl_price,
-        )
-        logger.info(f"[TRADE_ENGINE] order response: {order_response}")
-
-        deal_id = _extract_deal_id(order_response)
-        if not deal_id:
-            raise RuntimeError(f"No dealId in IG order response: {order_response}")
-
-        fill_level = _extract_fill_level(order_response)
-        stored_entry = fill_level if fill_level is not None else entry_ref
-
-        # Persist bot-managed trade (store REAL broker entry if we have it)
-        add_open_trade(
-            deal_id=str(deal_id),
+        create_trade_group(
+            trade_group_id=trade_group_id,
             symbol=symbol,
             side=side_raw,
-            entry_price=float(stored_entry),
-            tp_price=float(tp_price),
-            initial_sl=float(sl_price),
+            timeframe=getattr(tv_signal, "timeframe", None),
+        )
+    except Exception as e:
+        logger.exception(f"[TRADE_ENGINE] failed to create trade group: {e}")
+        return
+
+    # 5) 3 Orders mit unterschiedlichen TPs platzieren + speichern
+    for tp_index, (tp_points, size) in enumerate(zip(TP_LEVELS_POINTS, sizes), start=1):
+        tp_price = (entry_ref + tp_points) if is_long else (entry_ref - tp_points)
+
+        logger.info(
+            f"[TRADE_ENGINE] placing ladder order: group={trade_group_id} tp_index={tp_index} "
+            f"side={side_raw} tp_points={tp_points:.2f} TP={tp_price:.2f} SL={sl_price:.2f} "
+            f"size={size:.4f}"
         )
 
-        logger.info(f"[TRADE_ENGINE] stored bot trade deal_id={deal_id} entry={stored_entry:.2f}")
+        try:
+            order_response: Dict[str, Any] = await broker_client.place_market_order(
+                symbol=symbol,
+                side=side,
+                size=size,
+                take_profit=tp_price,
+                stop_loss=sl_price,
+            )
+            logger.info(f"[TRADE_ENGINE] order response (tp_index={tp_index}): {order_response}")
 
-    except Exception as e:
-        logger.exception(f"[TRADE_ENGINE] error while placing order: {e}")
+            deal_id = _extract_deal_id(order_response)
+            if not deal_id:
+                raise RuntimeError(f"No dealId in IG order response: {order_response}")
+
+            fill_level = _extract_fill_level(order_response)
+            stored_entry = fill_level if fill_level is not None else entry_ref
+
+            add_open_trade(
+                deal_id=str(deal_id),
+                trade_group_id=trade_group_id,
+                tp_index=tp_index,
+                symbol=symbol,
+                side=side_raw,
+                entry_price=float(stored_entry),
+                tp_price=float(tp_price),
+                initial_sl=float(sl_price),
+            )
+
+            logger.info(
+                f"[TRADE_ENGINE] stored bot trade group={trade_group_id} tp_index={tp_index} "
+                f"deal_id={deal_id} entry={stored_entry:.2f} TP={tp_price:.2f} SL0={sl_price:.2f} size={size:.4f}"
+            )
+
+        except Exception as e:
+            logger.exception(
+                f"[TRADE_ENGINE] error while placing ladder order (tp_index={tp_index}, TP={tp_points}): {e}"
+            )
+            continue
