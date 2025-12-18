@@ -1,6 +1,8 @@
 # src/services/trade_repo.py
 
-from typing import Set, Optional, List
+from typing import Set, Optional
+from datetime import datetime, timedelta
+
 from sqlalchemy import func, exists
 
 from db.database import SessionLocal
@@ -111,7 +113,12 @@ def get_trade_group_ids_for_deals(deal_ids: Set[str]) -> Set[str]:
 def recompute_trade_group_status(trade_group_id: str) -> None:
     db = SessionLocal()
     try:
-        total = db.query(func.count(BotTrade.id)).filter(BotTrade.trade_group_id == trade_group_id).scalar() or 0
+        total = (
+            db.query(func.count(BotTrade.id))
+            .filter(BotTrade.trade_group_id == trade_group_id)
+            .scalar()
+            or 0
+        )
         open_cnt = (
             db.query(func.count(BotTrade.id))
             .filter(BotTrade.trade_group_id == trade_group_id)
@@ -122,7 +129,7 @@ def recompute_trade_group_status(trade_group_id: str) -> None:
         closed_cnt = total - open_cnt
 
         if total == 0:
-            # sollte nicht passieren, aber sicherheitshalber
+            # Gruppe existiert, aber keine Trades dazu -> lieber CLOSED (oder ERROR)
             new_status = "CLOSED"
         elif open_cnt == 0:
             new_status = "CLOSED"
@@ -140,6 +147,18 @@ def recompute_trade_group_status(trade_group_id: str) -> None:
         db.close()
 
 
+def set_trade_group_status(trade_group_id: str, status: str) -> None:
+    db = SessionLocal()
+    try:
+        db.query(TradeGroup).filter(TradeGroup.trade_group_id == trade_group_id).update(
+            {"status": status},
+            synchronize_session=False,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def has_active_trade_group(symbol: str) -> bool:
     """
     True, wenn für dieses Symbol/Epic mindestens eine TradeGroup OPEN oder PARTIAL ist.
@@ -148,10 +167,79 @@ def has_active_trade_group(symbol: str) -> bool:
     try:
         q = db.query(
             exists().where(
-                (TradeGroup.symbol == symbol) &
-                (TradeGroup.status.in_(("OPEN", "PARTIAL")))
+                (TradeGroup.symbol == symbol)
+                & (TradeGroup.status.in_(("OPEN", "PARTIAL")))
             )
         )
         return bool(q.scalar())
+    finally:
+        db.close()
+
+
+def get_active_trade_group_ids() -> Set[str]:
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(TradeGroup.trade_group_id)
+            .filter(TradeGroup.status.in_(("OPEN", "PARTIAL")))
+            .all()
+        )
+        return {r[0] for r in rows if r and r[0]}
+    finally:
+        db.close()
+
+
+def count_open_trades_in_group(trade_group_id: str) -> int:
+    db = SessionLocal()
+    try:
+        cnt = (
+            db.query(func.count(BotTrade.id))
+            .filter(BotTrade.trade_group_id == trade_group_id)
+            .filter(BotTrade.status == "OPEN")
+            .scalar()
+        )
+        return int(cnt or 0)
+    finally:
+        db.close()
+
+
+def count_total_trades_in_group(trade_group_id: str) -> int:
+    db = SessionLocal()
+    try:
+        cnt = (
+            db.query(func.count(BotTrade.id))
+            .filter(BotTrade.trade_group_id == trade_group_id)
+            .scalar()
+        )
+        return int(cnt or 0)
+    finally:
+        db.close()
+
+
+def get_stale_empty_trade_groups(grace_seconds: int = 60) -> Set[str]:
+    """
+    Garbage Collector Helper:
+    Liefert TradeGroup IDs, die:
+      - status OPEN oder PARTIAL sind
+      - älter als grace_seconds
+      - und NOCH NIE BotTrades bekommen haben (total=0)
+
+    Wichtig: Das verhindert Race Conditions zwischen create_trade_group() und add_open_trade().
+    """
+    cutoff = datetime.utcnow() - timedelta(seconds=grace_seconds)
+
+    db = SessionLocal()
+    try:
+        # NOT EXISTS BotTrade rows for this group
+        no_trades_subq = ~exists().where(BotTrade.trade_group_id == TradeGroup.trade_group_id)
+
+        rows = (
+            db.query(TradeGroup.trade_group_id)
+            .filter(TradeGroup.status.in_(("OPEN", "PARTIAL")))
+            .filter(TradeGroup.created_at <= cutoff)  # TradeGroup muss created_at haben
+            .filter(no_trades_subq)
+            .all()
+        )
+        return {r[0] for r in rows if r and r[0]}
     finally:
         db.close()

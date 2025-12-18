@@ -13,11 +13,15 @@ from services.trade_repo import (
     mark_trades_closed,
     get_trade_group_ids_for_deals,
     recompute_trade_group_status,
+    set_trade_group_status,
+    get_stale_empty_trade_groups,     # ✅ NEW (race-safe GC)
 )
 
 POLL_SECONDS = 5
 MIN_SL_MOVE = 0.10
 ERROR_BACKOFF = 5.0
+
+GC_GRACE_SECONDS = 60  # ✅ nur Gruppen schließen, die >60s alt UND komplett leer sind
 
 
 def _opt_float(x: Any) -> Optional[float]:
@@ -104,16 +108,19 @@ class TradeLifeCycleManager:
                 await asyncio.sleep(ERROR_BACKOFF)
 
     async def _tick(self) -> None:
-        # ──────────────────────────────
+        # Garbage Collector (race-safe):
+        # schließt NUR Gruppen, die >GC_GRACE_SECONDS alt sind UND komplett leer (0 Trades total)
+        stale_empty = get_stale_empty_trade_groups(grace_seconds=GC_GRACE_SECONDS)
+        for gid in stale_empty:
+            logger.warning(f"[TradeLifeCycleManager] repairing stale empty group={gid} -> CLOSED")
+            set_trade_group_status(gid, "CLOSED")
+
         # 1) Load OPEN bot-managed deals from DB
-        # ──────────────────────────────
         managed_deals: Set[str] = get_open_bot_deal_ids()
         if not managed_deals:
             return
 
-        # ──────────────────────────────
-        # 2) Fetch open positions from broker (may be empty!)
-        # ──────────────────────────────
+        # 2) Fetch open positions from broker
         positions = await broker_client.get_open_positions()
 
         broker_open_ids: Set[str] = set()
@@ -129,30 +136,21 @@ class TradeLifeCycleManager:
                 if np["deal_id"] in managed_deals:
                     normalized.append(np)
 
-        # ──────────────────────────────
         # 3) Reconcile: DB OPEN but broker CLOSED
-        # ──────────────────────────────
         closed_ids = managed_deals - broker_open_ids
         if closed_ids:
-            logger.info(
-                f"[TradeLifeCycleManager] detected CLOSED deals: {sorted(closed_ids)}"
-            )
+            logger.info(f"[TradeLifeCycleManager] detected CLOSED deals: {sorted(closed_ids)}")
 
-            # 3a) update bot_trades
             mark_trades_closed(closed_ids)
 
-            # 3b) update trade_groups
             affected_groups = get_trade_group_ids_for_deals(closed_ids)
             for gid in affected_groups:
                 recompute_trade_group_status(gid)
 
-            # remove cached SLs for closed trades
             for did in closed_ids:
                 self._last_sl_by_deal.pop(did, None)
 
-        # ──────────────────────────────
         # 4) SL logic ONLY for still-open, bot-managed positions
-        # ──────────────────────────────
         if not normalized:
             return
 
@@ -179,29 +177,24 @@ class TradeLifeCycleManager:
             last_set = self._last_sl_by_deal.get(deal_id)
             ref_sl = last_set if last_set is not None else old_sl
 
-            # First SL ever
             if ref_sl is None:
                 logger.info(
-                    f"[TradeLifeCycleManager] initial SL set deal={deal_id} "
-                    f"{symbol} {side}: -> {new_sl:.2f}"
+                    f"[TradeLifeCycleManager] initial SL set deal={deal_id} {symbol} {side}: -> {new_sl:.2f}"
                 )
                 await broker_client.update_stop_loss(deal_id, new_sl, take_profit)
                 self._last_sl_by_deal[deal_id] = new_sl
                 continue
 
-            # Anti-spam
             if abs(new_sl - ref_sl) < MIN_SL_MOVE:
                 continue
 
-            # Never worsen SL
             if side == "long" and new_sl <= ref_sl:
                 continue
             if side == "short" and new_sl >= ref_sl:
                 continue
 
             logger.info(
-                f"[TradeLifeCycleManager] update SL deal={deal_id} {symbol} {side}: "
-                f"{ref_sl:.2f} -> {new_sl:.2f}"
+                f"[TradeLifeCycleManager] update SL deal={deal_id} {symbol} {side}: {ref_sl:.2f} -> {new_sl:.2f}"
             )
 
             await broker_client.update_stop_loss(deal_id, new_sl, take_profit)

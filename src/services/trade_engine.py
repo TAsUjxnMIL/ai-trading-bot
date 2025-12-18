@@ -13,6 +13,7 @@ from services.trade_repo import (
     add_open_trade,
     create_trade_group,
     has_active_trade_group,
+    set_trade_group_status,
 )
 
 
@@ -31,14 +32,13 @@ SL_BASE_POINTS: float = 10.0
 STEP_DIST_POINTS: float = 5.0
 STEP_SIZE_POINTS: float = 1.0
 
-# ✅ Gesamtgröße pro Signal (TradeGroup)
+# Gesamtgröße pro Signal (TradeGroup)
 TOTAL_POSITION_SIZE: float = 2.0
 
-# ✅ Size-Regeln für dein GOLD-Instrument laut Log:
+# Size-Regeln für dein GOLD-Instrument laut Log:
 # minDealSize=0.1 → typischerweise 0.1 Schritte
 SIZE_STEP: float = 0.1
 MIN_DEAL_SIZE: float = 0.1
-
 NUM_ORDERS: int = 3
 
 
@@ -121,12 +121,7 @@ def _round_down_to_step(x: float, step: float) -> float:
     return math.floor(x / step) * step
 
 
-def split_total_size(
-    total: float,
-    n: int,
-    step: float,
-    min_size: float,
-) -> List[float]:
+def split_total_size(total: float, n: int, step: float, min_size: float) -> List[float]:
     if n <= 0:
         raise ValueError("n must be > 0")
     if step <= 0:
@@ -190,7 +185,7 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
         logger.warning(f"[TRADE_ENGINE] Unknown side in signal: {side_raw}")
         return
 
-    # ✅ ENTRY-BLOCKER: keine neue TradeGroup wenn OPEN/PARTIAL existiert
+    # ENTRY-BLOCKER: keine neue TradeGroup wenn OPEN/PARTIAL existiert
     if has_active_trade_group(symbol):
         logger.info(
             f"[TRADE_ENGINE] skipping signal for {symbol}: active trade group (OPEN/PARTIAL) exists"
@@ -213,10 +208,10 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
     # 3) Initialer SL als fixer Abstand (10$)
     sl_price = (entry_ref - SL_INITIAL_POINTS) if is_long else (entry_ref + SL_INITIAL_POINTS)
 
-    # ✅ TradeGroup-ID für diese Trade-Idee (pro Signal neu)
+    # TradeGroup-ID für diese Trade-Idee (pro Signal neu)
     trade_group_id = str(uuid.uuid4())
 
-    # ✅ Dynamische Sizes berechnen (robust, step/min enforced)
+    # Dynamische Sizes berechnen (robust, step/min enforced)
     try:
         sizes = split_total_size(
             total=TOTAL_POSITION_SIZE,
@@ -234,7 +229,7 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
         f"SL0={sl_price:.2f} total_size={TOTAL_POSITION_SIZE} sizes={sizes}"
     )
 
-    # ✅ 4) TradeGroup in DB anlegen (einmal)
+    # 4) TradeGroup in DB anlegen (einmal)
     try:
         create_trade_group(
             trade_group_id=trade_group_id,
@@ -246,7 +241,8 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
         logger.exception(f"[TRADE_ENGINE] failed to create trade group: {e}")
         return
 
-    # 5) 3 Orders mit unterschiedlichen TPs platzieren + speichern
+    successful_trades = 0
+
     for tp_index, (tp_points, size) in enumerate(zip(TP_LEVELS_POINTS, sizes), start=1):
         tp_price = (entry_ref + tp_points) if is_long else (entry_ref - tp_points)
 
@@ -283,14 +279,17 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
                 tp_price=float(tp_price),
                 initial_sl=float(sl_price),
             )
-
-            logger.info(
-                f"[TRADE_ENGINE] stored bot trade group={trade_group_id} tp_index={tp_index} "
-                f"deal_id={deal_id} entry={stored_entry:.2f} TP={tp_price:.2f} SL0={sl_price:.2f} size={size:.4f}"
-            )
+            successful_trades += 1
 
         except Exception as e:
             logger.exception(
                 f"[TRADE_ENGINE] error while placing ladder order (tp_index={tp_index}, TP={tp_points}): {e}"
             )
             continue
+
+    # ✅ Fail-Safe gegen Zombie-Gruppen
+    if successful_trades == 0:
+        logger.warning(
+            f"[TRADE_ENGINE] no trades stored for group={trade_group_id} -> marking group CLOSED"
+        )
+        set_trade_group_status(trade_group_id, "CLOSED")
