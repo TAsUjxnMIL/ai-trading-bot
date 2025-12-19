@@ -1,9 +1,10 @@
 # src/broker/ig_client.py
+
 import os
 import time
-import logging
 from typing import Optional, Dict, Any, List
 
+import requests
 from trading_ig.rest import IGService
 
 from utils.logger import logger
@@ -59,23 +60,35 @@ class IGClient:
     def _symbol_to_epic(symbol: str) -> str:
         symbol = symbol.upper()
         if symbol in ("XAUUSD", "OANDA:XAUUSD", "FOREXCOM:XAUUSD", "FXCM:XAUUSD"):
-            return "CS.D.CFEGOLD.CEA.IP"  # Gold (33.20$) expiry=FEB-26 on your account
+            return "CS.D.CFEGOLD.CEA.IP"
         return symbol
 
     @staticmethod
     def _round_to_step(value: float, step: float) -> float:
-        """Round value to nearest multiple of step."""
         if step <= 0:
             return value
         return round(value / step) * step
+
+    def _recreate_session(self) -> None:
+        """
+        Best-effort re-login. Helps if IG drops the connection or session gets weird.
+        """
+        try:
+            logger.warning("[IG] recreating session ...")
+            self.ig.create_session()
+            if self.acc_number:
+                self.ig.switch_account(self.acc_number, default_account=False)
+            logger.info("[IG] session recreated")
+        except Exception as e:
+            logger.exception(f"[IG] failed to recreate session: {e}")
 
     def place_market_order(
         self,
         symbol: str,
         side: str,
         size: float,
-        take_profit: Optional[float] = None,  # price level (e.g. 4363.8)
-        stop_loss: Optional[float] = None,    # price level (e.g. 4348.8)
+        take_profit: Optional[float] = None,
+        stop_loss: Optional[float] = None,
         currency: str = "USD",
     ) -> Dict[str, Any]:
         """
@@ -107,7 +120,7 @@ class IGClient:
         bid = snapshot.get("bid") if hasattr(snapshot, "get") else getattr(snapshot, "bid", None)
         # Goldhändler sagt ich verkaufe zu dem Preis von Offer: Also wenn ich kaufe, bezahle ich den Preis
         offer = snapshot.get("offer") if hasattr(snapshot, "get") else getattr(snapshot, "offer", None)
-        
+
         logger.info(f"[IG] epic={epic} ... bid={bid} offer={offer} ...")
 
         if status != "TRADEABLE":
@@ -122,30 +135,27 @@ class IGClient:
         min_deal = None
         min_step_dist = None
         if rules is not None:
-            # min_deal: Minimale Handelsgröße
             min_deal = (rules.get("minDealSize") or {}).get("value") if hasattr(rules, "get") else None
-            # min_step_dist: Sagt aus, in welchen Schritten TP/SL gesetzt werden müssen
             min_step_dist = (rules.get("minStepDistance") or {}).get("value") if hasattr(rules, "get") else None
 
         if min_deal is not None and size < float(min_deal):
             raise RuntimeError(f"size={size} is below minDealSize={min_deal} for epic={epic}")
 
         step = float(min_step_dist) if min_step_dist is not None else 0.0
+        logger.info(
+            f"[IG] epic={epic} expiry={expiry} status={status} bid={bid} offer={offer} "
+            f"minDealSize={min_deal} minStepDistance={step}"
+        )
 
-        logger.info(f"[IG] epic={epic} expiry={expiry} status={status} bid={bid} offer={offer} minDealSize={min_deal} minStepDistance={step}")
-
-        # 2) Build "marketable limit" parameters
-        # Gold often has 0.1 price increments. We'll use a small buffer so it fills immediately.
         tick = 0.1
         buffer_ticks = 5  # 0.5
         if direction == "BUY":
-            order_level = round(offer + buffer_ticks * tick, 1)  # max price you're willing to pay
+            order_level = round(offer + buffer_ticks * tick, 1)
             entry_ref = offer
         else:
-            order_level = round(bid - buffer_ticks * tick, 1)    # min price you're willing to accept
+            order_level = round(bid - buffer_ticks * tick, 1)
             entry_ref = bid
 
-        # 3) Convert TP/SL price levels into distances (required by your installed trading-ig signature)
         stop_distance = None
         limit_distance = None
 
@@ -171,10 +181,6 @@ class IGClient:
             if step:
                 limit_distance = self._round_to_step(limit_distance, step)
 
-        # IMPORTANT:
-        # - Provide *_distance (required by your signature)
-        # - Set *_level to None (otherwise IG returns mutual-exclusive-set-value.request)
-        # - Use LIMIT + FILL_OR_KILL to avoid MARKET_ROLLED
         max_retries = 5
         sleep_s = 0.6
         last_resp: Optional[Dict[str, Any]] = None
@@ -188,19 +194,15 @@ class IGClient:
                 force_open=True,
                 guaranteed_stop=False,
                 order_type="LIMIT",
-                level=order_level, # The price we are willing to buy/sell at as we are using Limit Order
+                level=order_level,  # marketable limit
                 time_in_force="FILL_OR_KILL",
-
                 size=size,
 
-                # required by your installed signature
                 stop_distance=stop_distance,
                 limit_distance=limit_distance,
 
-                # must be None to avoid mutual exclusive validation
                 stop_level=None,
                 limit_level=None,
-
                 quote_id=None,
                 trailing_stop=False,
                 trailing_stop_increment=None,
@@ -223,16 +225,62 @@ class IGClient:
         raise RuntimeError(f"IG order failed after retries: {last_resp}")
 
     def get_open_positions(self) -> List[Dict[str, Any]]:
-        pos = self.ig.fetch_open_positions()
+        """
+        Robust against sporadic RemoteDisconnected/Connection aborted.
+        Strategy:
+          1) Retry a few times with exponential backoff (no re-login)
+          2) If still failing: recreate session once + do one final attempt
+        """
+        max_retries = 5
+        base_sleep = 0.5
 
-        # trading-ig often returns a pandas DataFrame
-        if hasattr(pos, "to_dict"):
-            return pos.to_dict(orient="records")
+        def _normalize(pos: Any) -> List[Dict[str, Any]]:
+            if hasattr(pos, "to_dict"):
+                return pos.to_dict(orient="records")
+            if isinstance(pos, list):
+                return pos
+            return [pos] if isinstance(pos, dict) else []
 
-        if isinstance(pos, list):
-            return pos
+        def _is_disconnect_exc(e: Exception) -> bool:
+            msg = str(e)
+            return ("RemoteDisconnected" in msg) or ("Connection aborted" in msg)
 
-        return [pos] if isinstance(pos, dict) else []
+        last_err: Optional[Exception] = None
+
+        # 1) Normal retries (no session recreation)
+        for attempt in range(1, max_retries + 1):
+            try:
+                pos = self.ig.fetch_open_positions()
+                return _normalize(pos)
+
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_err = e
+                sleep = base_sleep * (2 ** (attempt - 1))
+                logger.warning(
+                    f"[IG] fetch_open_positions transient error (attempt {attempt}/{max_retries}): {e} -> sleep {sleep:.2f}s"
+                )
+                time.sleep(sleep)
+
+            except Exception as e:
+                if _is_disconnect_exc(e):
+                    last_err = e
+                    sleep = base_sleep * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"[IG] fetch_open_positions disconnect (attempt {attempt}/{max_retries}): {e} -> sleep {sleep:.2f}s"
+                    )
+                    time.sleep(sleep)
+                    continue
+                raise
+
+        # 2) If still failing: recreate session once + final attempt
+        logger.warning(f"[IG] fetch_open_positions still failing after retries -> recreating session once. last_err={last_err}")
+        self._recreate_session()
+
+        try:
+            pos = self.ig.fetch_open_positions()
+            return _normalize(pos)
+        except Exception as e:
+            raise RuntimeError(f"IG fetch_open_positions failed after retries + session recreate: {e}") from e
 
     def get_current_price(self, symbol: str) -> float:
         epic = self._symbol_to_epic(symbol)
@@ -255,12 +303,10 @@ class IGClient:
         return (float(bid) + float(offer)) / 2.0
 
     def update_stop_loss(self, deal_id: str, new_stop: float, take_profit: Optional[float] = None) -> Dict[str, Any]:
-        # IGService has update_open_position in your installation
-        logger.info(f"[IG] updating SL for deal_id={deal_id} to new_stop={new_stop} take_profit={take_profit}")
         return self.ig.update_open_position(
             deal_id=deal_id,
             stop_level=float(new_stop),
-            limit_level=float(take_profit) if take_profit is not None else None
+            limit_level=float(take_profit) if take_profit is not None else None,
         )
 
     def get_bid_offer(self, symbol: str) -> tuple[float, float]:
