@@ -16,7 +16,6 @@ from services.trade_repo import (
     set_trade_group_status,
 )
 
-
 # ──────────────────────────────
 # Konfiguration – XAUUSD-Dollar (nicht Pips)
 # ──────────────────────────────
@@ -174,7 +173,7 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
     Strategie:
     - TradingView sendet Entry (long/short + price)
     - Bot eröffnet Market Position mit TP/initial SL (Stufe 0)
-    - dealId wird gespeichert, damit SLManager NUR Bot-Trades trailt
+    - dealId wird gespeichert, damit TradeLifeCycleManager NUR Bot-Trades trailt
     """
     logger.info(f"[TRADE_ENGINE] processing signal: {tv_signal}")
 
@@ -205,13 +204,12 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
     # 2) Entry-Referenz (Long -> Offer, Short -> Bid)
     entry_ref = offer if is_long else bid
 
-    # 3) Initialer SL als fixer Abstand (10$)
-    sl_price = (entry_ref - SL_INITIAL_POINTS) if is_long else (entry_ref + SL_INITIAL_POINTS)
+    # 3) Initialer SL als fixer Abstand (10$) – fürs ORDER-Placement erstmal aus entry_ref
+    sl_price_for_order = (entry_ref - SL_INITIAL_POINTS) if is_long else (entry_ref + SL_INITIAL_POINTS)
 
-    # TradeGroup-ID für diese Trade-Idee (pro Signal neu)
     trade_group_id = str(uuid.uuid4())
 
-    # Dynamische Sizes berechnen (robust, step/min enforced)
+    # Dynamische Sizes berechnen
     try:
         sizes = split_total_size(
             total=TOTAL_POSITION_SIZE,
@@ -226,10 +224,10 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
     logger.info(
         f"[TRADE_ENGINE] group={trade_group_id} | TV price={tv_signal.price} | "
         f"IG bid={bid:.2f} offer={offer:.2f} | entry_ref={entry_ref:.2f} side={side_raw} "
-        f"SL0={sl_price:.2f} total_size={TOTAL_POSITION_SIZE} sizes={sizes}"
+        f"SL0={sl_price_for_order:.2f} total_size={TOTAL_POSITION_SIZE} sizes={sizes}"
     )
 
-    # 4) TradeGroup in DB anlegen (einmal)
+    # TradeGroup in DB anlegen
     try:
         create_trade_group(
             trade_group_id=trade_group_id,
@@ -244,21 +242,24 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
     successful_trades = 0
 
     for tp_index, (tp_points, size) in enumerate(zip(TP_LEVELS_POINTS, sizes), start=1):
-        tp_price = (entry_ref + tp_points) if is_long else (entry_ref - tp_points)
+        # Fürs ORDER-Placement: TP erstmal aus entry_ref
+        tp_price_for_order = (entry_ref + tp_points) if is_long else (entry_ref - tp_points)
 
         logger.info(
             f"[TRADE_ENGINE] placing ladder order: group={trade_group_id} tp_index={tp_index} "
-            f"side={side_raw} tp_points={tp_points:.2f} TP={tp_price:.2f} SL={sl_price:.2f} "
-            f"size={size:.4f}"
+            f"side={side_raw} tp_points={tp_points:.2f} TP={tp_price_for_order:.2f} "
+            f"SL={sl_price_for_order:.2f} size={size:.4f}"
         )
 
         try:
+            # tp and sl wird als distance behandelt im ig client. Wir traden und erhalten den wahren Entry von IG.
+            # tp und sl sind abhängig vom tatsächlichen Entry.
             order_response: Dict[str, Any] = await broker_client.place_market_order(
                 symbol=symbol,
                 side=side,
                 size=size,
-                take_profit=tp_price,
-                stop_loss=sl_price,
+                take_profit=tp_price_for_order,
+                stop_loss=sl_price_for_order,
             )
             logger.info(f"[TRADE_ENGINE] order response (tp_index={tp_index}): {order_response}")
 
@@ -267,7 +268,11 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
                 raise RuntimeError(f"No dealId in IG order response: {order_response}")
 
             fill_level = _extract_fill_level(order_response)
-            stored_entry = fill_level if fill_level is not None else entry_ref
+            stored_entry = float(fill_level) if fill_level is not None else float(entry_ref)
+
+            # FIX: DB-Level basierend auf tatsächlichem Entry speichern (nicht entry_ref)
+            tp_price_db = (stored_entry + tp_points) if is_long else (stored_entry - tp_points)
+            sl_price_db = (stored_entry - SL_INITIAL_POINTS) if is_long else (stored_entry + SL_INITIAL_POINTS)
 
             add_open_trade(
                 deal_id=str(deal_id),
@@ -276,8 +281,8 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
                 symbol=symbol,
                 side=side_raw,
                 entry_price=float(stored_entry),
-                tp_price=float(tp_price),
-                initial_sl=float(sl_price),
+                tp_price=float(tp_price_db),
+                initial_sl=float(sl_price_db),
             )
             successful_trades += 1
 
@@ -287,7 +292,7 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
             )
             continue
 
-    # ✅ Fail-Safe gegen Zombie-Gruppen
+    # Fail-Safe gegen Zombie-Gruppen
     if successful_trades == 0:
         logger.warning(
             f"[TRADE_ENGINE] no trades stored for group={trade_group_id} -> marking group CLOSED"
