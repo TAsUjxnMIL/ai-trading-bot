@@ -55,203 +55,96 @@ def _extract_id_like_columns(cols: List[str]) -> List[str]:
     return keys
 
 
-def _extract_activity_candidates(df: Any, deal_id: str) -> Optional[Tuple[Any, str]]:
+def _extract_activity_candidates_flat(df: Any, deal_id: str) -> Any:
     """
-    Try to find activity rows related to a given deal_id.
-    We check common column names used by trading-ig formatting.
+    trading-ig often returns a flattened DF for activity when detailed=True
+    with columns:
+      - dealId
+      - affectedDealId
+      - actionType
+      - level, stopLevel, limitLevel ...
+    So we match via (dealId == deal_id) OR (affectedDealId == deal_id).
     """
     if df is None or len(df) == 0 or not deal_id:
-        return None
+        return df.iloc[0:0]
 
-    candidate_cols = [c for c in df.columns if c.lower() in ("dealid", "affecteddealid", "deal_id", "affected_deal_id")]
-    if not candidate_cols:
-        candidate_cols = [c for c in df.columns if ("deal" in c.lower() and "id" in c.lower())]
+    deal_id_s = str(deal_id)
 
-    if not candidate_cols:
-        return None
+    cols = {c.lower(): c for c in df.columns}
+    deal_col = cols.get("dealid")
+    aff_col = cols.get("affecteddealid")
 
-    for col in candidate_cols:
+    if not deal_col and not aff_col:
+        # fallback: try any column containing deal + id
+        for c in df.columns:
+            cl = c.lower()
+            if "deal" in cl and "id" in cl and not deal_col:
+                deal_col = c
+            if "affected" in cl and "deal" in cl and "id" in cl and not aff_col:
+                aff_col = c
+
+    mask = None
+    if deal_col:
         try:
-            hits = df[df[col].astype(str) == str(deal_id)]
-            if len(hits) > 0:
-                return hits, col
+            mask = (df[deal_col].astype(str) == deal_id_s)
         except Exception:
-            continue
+            pass
 
-    return None
+    if aff_col:
+        try:
+            m2 = (df[aff_col].astype(str) == deal_id_s)
+            mask = m2 if mask is None else (mask | m2)
+        except Exception:
+            pass
+
+    if mask is None:
+        return df.iloc[0:0]
+
+    return df[mask]
 
 
-def _guess_execution_level_from_activity_row(row: Dict[str, Any]) -> Optional[float]:
+def _is_closeish_action_type(action_type: str) -> bool:
+    s = (action_type or "").upper()
+    return any(
+        k in s
+        for k in [
+            "POSITION_CLOSED",
+            "POSITION_PARTIALLY_CLOSED",
+            "STOP_ORDER_FILLED",
+            "LIMIT_ORDER_FILLED",
+            "STOP_LIMIT",
+            "LIMIT_ORDER",
+            "STOP_ORDER",
+        ]
+    )
+
+
+def _print_flat_row(row: Dict[str, Any], *, show_all_fields: bool = False) -> None:
     """
-    In IG activity, execution level often appears as:
-      - 'level'
-      - 'details.level'
-    trading-ig formatted DF often flattens nested details into columns like:
-      - level, stopLevel, limitLevel, ...
-    Note: For POSITION_OPENED, 'level' == entry. For close events, 'level' may be close execution price.
+    Print one flattened activity row.
     """
-    for key in ["level", "details.level", "details_level"]:
-        if key in row and row[key] is not None:
-            try:
-                return float(row[key])
-            except Exception:
-                pass
-    return None
+    print("\n--- ACTIVITY ROW ---")
+    if show_all_fields:
+        # full dump (sorted keys for readability)
+        for k in sorted(row.keys()):
+            v = row.get(k)
+            if v is not None and str(v) != "nan":
+                print(f"{k}: {v}")
+        return
 
-
-def _guess_reason_from_activity_row(row: Dict[str, Any]) -> str:
-    """
-    Guess close reason from actionType/type/description when possible.
-    """
-    t = str(row.get("actionType") or row.get("action_type") or "").upper()
-    typ = str(row.get("type") or "").upper()
-    desc = str(row.get("description") or "").upper()
-    blob = " ".join([t, typ, desc])
-
-    if "LIMIT_ORDER_FILLED" in blob:
-        return "TP/LIMIT_FILLED"
-    if "STOP_ORDER_FILLED" in blob:
-        return "SL/STOP_FILLED"
-    if "POSITION_CLOSED" in blob:
-        return "POSITION_CLOSED"
-    if "POSITION_PARTIALLY_CLOSED" in blob:
-        return "POSITION_PARTIALLY_CLOSED"
-    if "POSITION_OPENED" in blob:
-        return "POSITION_OPENED"
-    return "UNKNOWN"
-
-
-def _find_deal_reference_in_activity_row(row: Dict[str, Any], df_columns: Optional[List[str]] = None) -> Optional[str]:
-    """
-    trading-ig may flatten nested 'details.dealReference' into various column names.
-    We check:
-      - direct keys in row
-      - any df columns containing 'dealReference' (case-insensitive)
-      - common flattened variants: details.dealReference, details_dealReference, dealReference.1, etc.
-    """
-    # 1) direct keys (if row already contains it)
-    direct_keys = [
-        "dealReference",
-        "deal_reference",
-        "details.dealReference",
-        "details_dealReference",
-        "details.deal_reference",
-        "details_deal_reference",
+    # compact useful subset
+    keys = [
+        "date", "type", "status", "channel", "epic", "marketName", "period",
+        "dealId", "affectedDealId", "actionType",
+        "direction", "size",
+        "level", "stopLevel", "limitLevel", "stopDistance", "limitDistance",
+        "description",
     ]
-    for k in direct_keys:
-        v = row.get(k)
-        if v is not None and str(v).strip() != "":
-            return str(v)
-
-    # 2) if we have DF columns, scan for any column name that contains "dealreference"
-    if df_columns:
-        for c in df_columns:
-            if "dealreference" in c.lower():
-                v = row.get(c)
-                if v is not None and str(v).strip() != "":
-                    return str(v)
-
-    return None
-
-
-def _get_tx_closelevel_by_reference(
-    ig: IGService,
-    ref: str,
-    lookback_hours: float,
-    page_size: int = 200,
-    max_pages: int = 6
-) -> Optional[float]:
-    from datetime import datetime, timedelta
-
-    to_date = datetime.utcnow()
-    from_date = to_date - timedelta(hours=float(lookback_hours))
-
-    for page in range(1, max_pages + 1):
-        tx = _with_backoff(lambda: ig.fetch_transaction_history(
-            from_date=from_date,
-            to_date=to_date,
-            page_size=page_size,
-            page_number=page,
-        ))
-
-        if not _is_dataframe(tx) or len(tx) == 0:
-            continue
-
-        if "reference" not in tx.columns:
-            continue
-
-        hits = tx[tx["reference"].astype(str) == str(ref)]
-        if len(hits) == 0:
-            continue
-
-        if "dateUtc" in hits.columns:
-            hits = hits.sort_values(by="dateUtc", ascending=False)
-
-        if "closeLevel" in hits.columns:
-            try:
-                return float(hits.iloc[0]["closeLevel"])
-            except Exception:
-                return None
-
-    return None
-
-
-def _deep_scan_deal_reference(df: Any, max_rows: int = 50) -> None:
-    """
-    Thoroughly scans DataFrame for any dealReference signal:
-      - columns containing 'ref'
-      - columns containing 'dealReference' (case-insensitive)
-      - if a 'details' column exists and stores dict/json-like objects, tries to extract details['dealReference']
-    """
-    print("\n=== DEEP SCAN: dealReference ===")
-
-    # 1) columns containing 'ref'
-    ref_cols = [c for c in df.columns if "ref" in c.lower()]
-    print("Columns containing 'ref':", ref_cols)
-
-    for c in ref_cols:
-        try:
-            s = df[c]
-            non_empty = df[~s.isna() & (s.astype(str).str.strip() != "")]
-            print(f"\n-- Column '{c}' non-empty count:", len(non_empty))
-            if len(non_empty) > 0:
-                print(non_empty[[c]].head(max_rows).to_string(index=False))
-        except Exception as e:
-            print(f"[WARN] Could not inspect column '{c}': {e}")
-
-    # 2) columns containing 'dealReference'
-    dealref_cols = [c for c in df.columns if "dealreference" in c.lower()]
-    print("\nColumns containing 'dealReference' (any casing):", dealref_cols)
-
-    for c in dealref_cols:
-        try:
-            s = df[c]
-            non_empty = df[~s.isna() & (s.astype(str).str.strip() != "")]
-            print(f"\n-- Column '{c}' non-empty count:", len(non_empty))
-            if len(non_empty) > 0:
-                print(non_empty[[c]].head(max_rows).to_string(index=False))
-        except Exception as e:
-            print(f"[WARN] Could not inspect column '{c}': {e}")
-
-    # 3) if there is a 'details' column, try extracting dealReference from dicts
-    if "details" in df.columns:
-        print("\nFound 'details' column. Scanning first rows for details['dealReference'] / actions[*] ...")
-        hits: List[Tuple[int, str]] = []
-        for idx, v in df["details"].head(max_rows).items():
-            if isinstance(v, dict):
-                dr = v.get("dealReference")
-                if dr:
-                    hits.append((idx, str(dr)))
-                actions = v.get("actions")
-                if isinstance(actions, list):
-                    for a in actions:
-                        if isinstance(a, dict) and a.get("dealReference"):
-                            hits.append((idx, str(a.get("dealReference"))))
-            elif isinstance(v, str) and "dealReference" in v:
-                hits.append((idx, "[string_contains_dealReference]"))
-        print("details-derived hits:", hits[:20] if hits else "None")
-
-    print("\n=== END DEEP SCAN ===")
+    for k in keys:
+        if k in row:
+            v = row.get(k)
+            if v is not None and str(v) != "nan":
+                print(f"{k}: {v}")
 
 
 def main() -> None:
@@ -259,17 +152,30 @@ def main() -> None:
     env_path = Path(__file__).resolve().parents[2] / ".env"  # trading-bot/.env
     load_dotenv(dotenv_path=env_path, override=False)
 
-    p = argparse.ArgumentParser("IG test account activity (deal_id) + dealReference deep scan")
+    p = argparse.ArgumentParser("IG test account activity (deal_id) + actionType/affectedDealId dump (flattened DF)")
+
     p.add_argument("--env", choices=["PRACTICE", "LIVE"], default=(os.getenv("IG_ENV") or "PRACTICE").upper())
     p.add_argument("--force-live", action="store_true", help="ALLOW LIVE (DANGEROUS)")
 
+    # IMPORTANT: user wants this mandatory
     p.add_argument("--deal-id", required=True, help="Deal ID like DIAAAAV2...")
+
     p.add_argument("--lookback-hours", type=float, default=24.0)
     p.add_argument("--page-size", type=int, default=200)
-    p.add_argument("--max-rows", type=int, default=30)
-    p.add_argument("--detailed", action="store_true", help="Call activity with detailed=True")
-    p.add_argument("--cross-history", action="store_true", help="If dealReference found, lookup closeLevel in transaction history")
-    p.add_argument("--deep-scan", action="store_true", help="Do a thorough scan for dealReference in DF")
+    p.add_argument("--max-rows", type=int, default=200)
+
+    # Always detailed so we get actionType/affectedDealId columns
+    p.add_argument("--dump-rows", action="store_true", help="Print matching activity rows")
+    p.add_argument("--only-closeish-actions", action="store_true", help="Only show rows whose actionType looks like close/TP/SL")
+    p.add_argument("--show-all-fields", action="store_true", help="Dump every non-empty field for each row")
+
+    # KEY FIX: do not pass dealId to IG API (otherwise you may miss close events that only reference affectedDealId)
+    p.add_argument(
+        "--no-api-deal-filter",
+        action="store_true",
+        help="Fetch activity WITHOUT dealId=... (server filter). Required to catch close events where your deal id appears only as affectedDealId.",
+    )
+
     args = p.parse_args()
 
     ig = _connect_ig(args.env, args.force_live)
@@ -279,18 +185,23 @@ def main() -> None:
     to_date = datetime.utcnow()
     from_date = to_date - timedelta(hours=float(args.lookback_hours))
 
+    detailed = True  # we need actionType/affectedDealId columns
+
     print("\n--- FETCH ACCOUNT ACTIVITY ---")
-    print("deal_id:", args.deal_id)
+    print("deal_id (local filter):", args.deal_id)
+    print("no_api_deal_filter:", bool(args.no_api_deal_filter))
     print("from_date (UTC):", from_date.isoformat())
     print("to_date   (UTC):", to_date.isoformat())
-    print("detailed:", bool(args.detailed))
+    print("detailed:", detailed)
     print("page_size:", args.page_size)
+
+    api_deal_id = None if args.no_api_deal_filter else args.deal_id
 
     act = _with_backoff(lambda: ig.fetch_account_activity(
         from_date=from_date,
         to_date=to_date,
-        detailed=bool(args.detailed),
-        deal_id=args.deal_id,
+        detailed=detailed,
+        deal_id=api_deal_id,   # IMPORTANT: can be None
         page_size=args.page_size,
     ))
 
@@ -301,52 +212,47 @@ def main() -> None:
         print(act)
         raise SystemExit(1)
 
+    print("\nColumns:", list(act.columns))
+
     id_cols = _extract_id_like_columns(list(act.columns))
     print("\nID/LEVEL/TYPE columns detected:", id_cols)
 
     if id_cols:
         print("\nSample (id-like cols):")
-        print(act[id_cols].head(args.max_rows).to_string(index=False))
+        print(act[id_cols].head(10).to_string(index=False))
 
-    if args.deep_scan:
-        _deep_scan_deal_reference(act, max_rows=max(args.max_rows, 50))
+    # Match locally via dealId OR affectedDealId (flattened DF)
+    hits = _extract_activity_candidates_flat(act, args.deal_id)
+    print(f"\nMatched rows where dealId==deal_id OR affectedDealId==deal_id: {len(hits)}")
 
-    res = _extract_activity_candidates(act, args.deal_id)
-    if res is None:
-        print(f"\n[INFO] No rows matched deal_id={args.deal_id} via dealId/affectedDealId columns.")
-        print("Try increasing --lookback-hours and --page-size, or run with --deep-scan to inspect ref fields.")
-        print("\nAll columns:")
-        print(list(act.columns))
-        print("\nHead:")
-        print(act.head(args.max_rows).to_string(index=False))
+    if len(hits) == 0:
+        print("\n[INFO] No matching rows found.")
+        print("Try:")
+        print("  - increasing --lookback-hours")
+        print("  - using --no-api-deal-filter (recommended)")
+        print("  - increasing --page-size (max 500)")
         return
 
-    hits, col = res
-    print(f"\n✅ Matched {len(hits)} row(s) by column '{col}' == deal_id")
+    # Optional: only close-ish by actionType
+    if args.only_closeish_actions and "actionType" in hits.columns:
+        before = len(hits)
+        hits = hits[hits["actionType"].astype(str).apply(lambda s: _is_closeish_action_type(str(s)))]
+        print(f"Filtered close-ish actionType rows: {len(hits)} (from {before})")
 
-    # pick newest row by best available timestamp column
-    sort_col = None
-    for c in ["dateUtc", "date", "timestamp", "createdDateUtc", "createdDate"]:
-        if c in hits.columns:
-            sort_col = c
-            break
-    if sort_col:
-        hits = hits.sort_values(by=sort_col, ascending=False)
+    # Sort newest-first by 'date' if available
+    if "date" in hits.columns:
+        hits = hits.sort_values(by="date", ascending=False)
 
-    top = hits.iloc[0].to_dict()
-    exec_level = _guess_execution_level_from_activity_row(top)
-    reason = _guess_reason_from_activity_row(top)
-    deal_ref = _find_deal_reference_in_activity_row(top, df_columns=list(hits.columns))
-
-    print("\n--- BEST GUESS (latest matching activity row) ---")
-    print("execution_level_from_activity:", exec_level)
-    print("actionType/type reason guess:", reason)
-    print("dealReference (if any):", deal_ref)
-
-    if args.cross_history and deal_ref:
-        tx_close = _get_tx_closelevel_by_reference(ig, deal_ref, lookback_hours=args.lookback_hours)
-        print("\n--- CROSS CHECK (transaction history by reference == dealReference) ---")
-        print("tx_closeLevel:", tx_close)
+    if args.dump_rows:
+        print("\n=== MATCHING ACTIVITY ROWS ===")
+        for _, r in hits.head(args.max_rows).iterrows():
+            _print_flat_row(r.to_dict(), show_all_fields=bool(args.show_all_fields))
+        print("\n=== END ===")
+    else:
+        # Default: compact table view
+        view_cols = [c for c in ["date", "type", "status", "dealId", "affectedDealId", "actionType", "level", "stopLevel", "limitLevel", "description"] if c in hits.columns]
+        print("\n--- SUMMARY (matching rows) ---")
+        print(hits[view_cols].head(min(args.max_rows, 30)).to_string(index=False))
 
     print("\nDone.")
 
