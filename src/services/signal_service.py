@@ -37,6 +37,7 @@ async def handle_signal(tv_signal: TradingviewSignal):
         db.add(db_signal)
         db.commit()
         db.refresh(db_signal)
+        signal_id = int(db_signal.id)
         logger.info(f"Saved signal in DB with id={db_signal.id}")
     except Exception as e:
         db.rollback()
@@ -45,6 +46,6 @@ async def handle_signal(tv_signal: TradingviewSignal):
     finally:
         db.close()
 
-    # 3) (Optional) hier direkt deine Trade-Engine rufen:
-    await trade_engine.process_signal(tv_signal)
+    # 3) Hier direkt deine Trade-Engine rufen:
+    await trade_engine.process_signal(tv_signal, signal_id=signal_id)
     

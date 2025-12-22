@@ -32,7 +32,7 @@ STEP_DIST_POINTS: float = 5.0
 STEP_SIZE_POINTS: float = 1.0
 
 # Gesamtgröße pro Signal (TradeGroup)
-TOTAL_POSITION_SIZE: float = 2.0
+TOTAL_POSITION_SIZE: float = 6.0
 
 # Size-Regeln für dein GOLD-Instrument laut Log:
 # minDealSize=0.1 → typischerweise 0.1 Schritte
@@ -166,7 +166,7 @@ def split_total_size(total: float, n: int, step: float, min_size: float) -> List
     return sizes
 
 
-async def process_signal(tv_signal: TradingviewSignal) -> None:
+async def process_signal(tv_signal: TradingviewSignal, signal_id: int) -> None:
     """
     TradingView-Webhook → Bot-Logik → Order bei IG.
 
@@ -209,7 +209,7 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
 
     trade_group_id = str(uuid.uuid4())
 
-    # Dynamische Sizes berechnen
+    # Dynamische Sizes berechnen: Das macht nur Sinn, um die Verluste kleinzuhalten, aber das reduziert uns nicht unbedingt den Verlust relativ
     try:
         sizes = split_total_size(
             total=TOTAL_POSITION_SIZE,
@@ -234,6 +234,7 @@ async def process_signal(tv_signal: TradingviewSignal) -> None:
             symbol=symbol,
             side=side_raw,
             timeframe=getattr(tv_signal, "timeframe", None),
+            signal_id=signal_id,
         )
     except Exception as e:
         logger.exception(f"[TRADE_ENGINE] failed to create trade group: {e}")
