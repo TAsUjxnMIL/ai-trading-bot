@@ -111,6 +111,26 @@ async def get_open_positions() -> List[Dict[str, Any]]:
     return await asyncio.to_thread(fn)
 
 
+async def fetch_account_activity(
+    from_date,   # datetime
+    to_date,     # datetime
+    detailed: bool = True,
+    page_size: int = 500,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch IG account activity as raw JSON list of activity entries.
+
+    from_date/to_date should be datetime objects (ideally UTC).
+    """
+    client = await _get_client()
+    fn = getattr(client, "fetch_account_activity")
+
+    if _is_coro(fn):
+        return await fn(from_date, to_date, detailed, page_size)
+
+    return await asyncio.to_thread(fn, from_date, to_date, detailed, page_size)
+
+
 # Optional: call from FastAPI shutdown if you later add close() on clients.
 async def shutdown():
     global _client

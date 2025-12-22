@@ -3,12 +3,16 @@
 import os
 import time
 from typing import Optional, Dict, Any, List
-
+from datetime import datetime, timezone
 import requests
 from trading_ig.rest import IGService
 
 from utils.logger import logger
 
+
+class MarketClosedError(RuntimeError):
+    """Raised when IG returns a market snapshot without tradable bid/offer (e.g., marketStatus=CLOSED)."""
+    pass
 
 class IGClient:
     """
@@ -106,6 +110,9 @@ class IGClient:
         # 1) Fetch market details (truth source)
         market = self.ig.fetch_market_by_epic(epic)
 
+        # IG returns either dict or object with attributes depending on version
+        # 1.) market is dict-like and contains the method get as an attribute
+        # 2.) market is an object with attributes (e.g. instrument, snapshot, dealingRules)
         instrument = market.get("instrument") if hasattr(market, "get") else getattr(market, "instrument", None)
         snapshot = market.get("snapshot") if hasattr(market, "get") else getattr(market, "snapshot", None)
         rules = market.get("dealingRules") if hasattr(market, "get") else getattr(market, "dealingRules", None)
@@ -147,6 +154,15 @@ class IGClient:
             f"minDealSize={min_deal} minStepDistance={step}"
         )
 
+        # Explanaton of LIMIT, FILL_OR_KILL, marketable limit:
+        # LIMIT ORDER: 
+        #   BUY LIMIT: order will only execute at limit price or lower -> Ich kaufe nicht teurer als den Limitpreis
+        #   SELL LIMIT: order will only execute at limit price or higher -> Ich verkaufe nicht billiger als den Limitpreis
+        # FILL_OR_KILL: either fully executed immediately at the limit price (or better) or cancelled
+        # Marketable LIMIT:
+        #   BUY: set limit slightly above current offer -> sofortige Ausführung
+        #   SELL: set limit slightly below current bid -> sofortige Ausführung
+        # This is what we do with order_level below.
         tick = 0.1
         buffer_ticks = 5  # 0.5
         if direction == "BUY":
@@ -290,11 +306,15 @@ class IGClient:
         if snapshot is None:
             raise RuntimeError(f"Market snapshot missing: {market}")
 
+        status = snapshot.get("marketStatus") if hasattr(snapshot, "get") else getattr(snapshot, "marketStatus", None)
         bid = snapshot.get("bid") if hasattr(snapshot, "get") else getattr(snapshot, "bid", None)
         offer = snapshot.get("offer") if hasattr(snapshot, "get") else getattr(snapshot, "offer", None)
 
-        if bid is None and offer is None:
-            raise RuntimeError(f"Missing bid/offer in snapshot: {snapshot}")
+        # Minimal but robust handling for CLOSED / not quoted markets
+        if status != "TRADEABLE" or (bid is None and offer is None):
+            raise MarketClosedError(
+                f"Missing bid/offer or not tradeable: epic={epic} status={status} bid={bid} offer={offer}"
+            )
 
         if bid is None:
             return float(offer)
@@ -313,6 +333,61 @@ class IGClient:
         epic = self._symbol_to_epic(symbol)
         market = self.ig.fetch_market_by_epic(epic)
         snapshot = market.get("snapshot", {}) or {}
-        bid = float(snapshot["bid"])
-        offer = float(snapshot["offer"])
-        return bid, offer
+
+        status = snapshot.get("marketStatus")
+        bid = snapshot.get("bid")
+        offer = snapshot.get("offer")
+
+        if status != "TRADEABLE" or bid is None or offer is None:
+            raise MarketClosedError(f"No tradable bid/offer: epic={epic} status={status} bid={bid} offer={offer}")
+
+        return float(bid), float(offer)
+    
+
+    def fetch_account_activity(
+        self,
+        from_date: Optional[datetime] = None,
+        to_date: Optional[datetime] = None,
+        detailed: bool = True,
+        page_size: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """
+        Returns raw account activity entries as List[Dict[str, Any]].
+
+        Note: trading-ig may return a DataFrame-like object; we normalize to list-of-dicts.
+        """
+
+        # trading-ig signature may differ slightly; the common one is:
+        # fetch_account_activity_by_date(from_date, to_date, detailed=False, page_size=20, ...)
+        resp = self.ig.fetch_account_activity(
+            from_date=from_date,
+            to_date=to_date,
+            detailed=detailed,
+            page_size=page_size,
+        )
+
+        # Normalize to list[dict]
+        if resp is None:
+            return []
+
+        # DataFrame-like
+        if hasattr(resp, "to_dict"):
+            try:
+                return resp.to_dict(orient="records")
+            except TypeError:
+                # some pandas versions don't support orient kw the same way
+                return list(resp.to_dict().values())
+
+        # Already list of dicts
+        if isinstance(resp, list):
+            return [x for x in resp if isinstance(x, dict)]
+
+        # Some versions return {"activities": [...]} or similar
+        if isinstance(resp, dict):
+            for key in ("activities", "activity", "data"):
+                v = resp.get(key)
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+            # fallback: single dict entry
+            return []
+        return []
