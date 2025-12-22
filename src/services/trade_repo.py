@@ -15,6 +15,7 @@ def create_trade_group(
     symbol: str,
     side: str,
     timeframe: Optional[str] = None,
+    signal_id: Optional[int] = None,
 ) -> None:
     """
     Erstellt einen TradeGroup-Eintrag (einmal pro TradingView Signal / Trade-Idee).
@@ -28,6 +29,7 @@ def create_trade_group(
                 side=side,
                 timeframe=timeframe,
                 status="OPEN",
+                signal_id=signal_id,
             )
         )
         db.commit()
@@ -241,5 +243,88 @@ def get_stale_empty_trade_groups(grace_seconds: int = 60) -> Set[str]:
             .all()
         )
         return {r[0] for r in rows if r and r[0]}
+    finally:
+        db.close()
+
+
+def get_trade_by_deal_id(deal_id: str) -> Optional[BotTrade]:
+    """
+    Returns the BotTrade row for a given IG position deal_id (or None if not found).
+    """
+    db = SessionLocal()
+    try:
+        return (
+            db.query(BotTrade)
+            .filter(BotTrade.deal_id == deal_id)
+            .one_or_none()
+        )
+    finally:
+        db.close()
+
+
+def get_open_trades_in_group(
+    trade_group_id: str,
+    exclude_deal_id: Optional[str] = None,
+) -> list[BotTrade]:
+    """
+    Returns all OPEN BotTrades in a trade group. Optionally exclude one deal_id
+    (useful when TP1 trade just closed and you want "remaining" trades).
+    """
+    db = SessionLocal()
+    try:
+        q = (
+            db.query(BotTrade)
+            .filter(BotTrade.trade_group_id == trade_group_id)
+            .filter(BotTrade.status == "OPEN")
+        )
+        if exclude_deal_id:
+            q = q.filter(BotTrade.deal_id != exclude_deal_id)
+
+        return q.order_by(BotTrade.tp_index.asc()).all()
+    finally:
+        db.close()
+
+
+def set_trade_close_meta(
+    deal_id: str,
+    closed_price: Optional[float],
+    close_reason: Optional[str],
+    closed_at: Optional[datetime] = None,  # optional, kannst du None lassen
+) -> None:
+    db = SessionLocal()
+    try:
+        update_data = {}
+        if closed_price is not None:
+            update_data["closed_price"] = float(closed_price)
+        if close_reason is not None:
+            update_data["close_reason"] = str(close_reason)
+        if closed_at is not None:
+            update_data["closed_at"] = closed_at
+
+        if not update_data:
+            return
+
+        db.query(BotTrade).filter(BotTrade.deal_id == deal_id).update(
+            update_data,
+            synchronize_session=False,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_trade_in_group_by_tp_index(trade_group_id: str, tp_index: int) -> Optional[BotTrade]:
+    """
+    Returns the BotTrade in the given group with the given tp_index (e.g. TP1 trade),
+    regardless of OPEN/CLOSED status (because TP1 is already closed when TP2 hits).
+    """
+    db = SessionLocal()
+    try:
+        return (
+            db.query(BotTrade)
+            .filter(BotTrade.trade_group_id == trade_group_id)
+            .filter(BotTrade.tp_index == tp_index)
+            .one_or_none()
+        )
     finally:
         db.close()
