@@ -1,6 +1,7 @@
 # app/models/signal.py
 from sqlalchemy import Column, Integer, String, Float, DateTime, JSON
 from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship
 from db.database import Base  # dein declarative_base()
 from models.tradingview_signal import TradingviewSignal
 
@@ -17,6 +18,8 @@ class Signal(Base):
     status      = Column(String, default="new")
     raw_payload = Column(JSON)
     source      = Column(String, default="tradingview")
+    # signal -> many trade groups
+    trade_groups = relationship("TradeGroup", back_populates="signal")
 
     @classmethod
     def from_tradingview(cls, tv: TradingviewSignal) -> "Signal":
