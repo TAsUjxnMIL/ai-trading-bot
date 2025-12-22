@@ -14,6 +14,7 @@ from services import signal_service
 from models.tradingview_signal import TradingviewSignal
 from models.signal import Signal
 from models.bot_trade import BotTrade
+from models.trade_group import TradeGroup
 from db.database import Base, engine
 from services.trade_lifecycle_mgr import TradeLifeCycleManager
 
