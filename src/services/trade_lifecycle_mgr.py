@@ -439,7 +439,7 @@ class TradeLifeCycleManager:
             last_set = self._last_sl_by_deal.get(deal_id)
             ref_sl = last_set if last_set is not None else old_sl
 
-            logger.info(f"[TLM] deal={deal_id} entry={entry:.2f} old_sl={old_sl} new_sl={new_sl:.2f}")
+            #logger.info(f"[TLM] deal={deal_id} entry={entry:.2f} old_sl={old_sl} new_sl={new_sl:.2f}")
 
             if ref_sl is None:
                 logger.info(

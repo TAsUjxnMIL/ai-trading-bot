@@ -24,7 +24,7 @@ from services.trade_repo import (
 TP_LEVELS_POINTS: List[float] = [3.0, 6.0, 9.0]
 
 # Initialer Stop (fixer Abstand)
-SL_INITIAL_POINTS: float = 50.0
+SL_INITIAL_POINTS: float = 10.0
 
 # Step-Trailing Parameter (wird vom TradeLifeCycleManager genutzt)
 SL_BASE_POINTS: float = 10.0
