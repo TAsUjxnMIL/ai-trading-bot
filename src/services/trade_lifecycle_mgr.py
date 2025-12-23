@@ -9,7 +9,7 @@ from utils.logger import logger
 from broker import broker_client
 from broker.ig_client import MarketClosedError
 
-from services.trade_engine import compute_step_sl_long, compute_step_sl_short
+from services.trade_engine import compute_step_sl_long, compute_step_sl_short, SL_INITIAL_POINTS
 from services.trade_repo import (
     get_open_bot_deal_ids,
     mark_trades_closed,
@@ -430,14 +430,16 @@ class TradeLifeCycleManager:
                 continue
 
             new_sl = (
-                compute_step_sl_long(entry, current_price)
+                compute_step_sl_long(entry, current_price, sl_base=SL_INITIAL_POINTS)
                 if side == "long"
-                else compute_step_sl_short(entry, current_price)
+                else compute_step_sl_short(entry, current_price, sl_base=SL_INITIAL_POINTS)
             )
 
             old_sl = pos["stop_loss"]
             last_set = self._last_sl_by_deal.get(deal_id)
             ref_sl = last_set if last_set is not None else old_sl
+
+            logger.info(f"[TLM] deal={deal_id} entry={entry:.2f} old_sl={old_sl} new_sl={new_sl:.2f}")
 
             if ref_sl is None:
                 logger.info(
