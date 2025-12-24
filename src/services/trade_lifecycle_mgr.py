@@ -33,7 +33,7 @@ ACTIVITY_LOOKBACK_MINUTES = 24 * 60  # 24h
 
 # classification tolerance (XAUUSD-ish)
 CLOSE_EPS = 0.15
-BREAKEVEN_BUFFER = 0.20  # move SL to entry +/- buffer
+BREAKEVEN_BUFFER = 0.80  # move SL to entry +/- buffer
 
 
 def _opt_float(x: Any) -> Optional[float]:
