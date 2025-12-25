@@ -10,7 +10,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .trading_bot.db:/app/trading_bot.db
+      - ./trading_bot.db:/app/trading_bot.db
 
   worker:
     build: .
@@ -21,4 +21,4 @@ services:
     env_file:
       - ./.env
     volumes:
-      - .trading_bot.db:/app/trading_bot.db
+      - ./trading_bot.db:/app/trading_bot.db
