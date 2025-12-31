@@ -51,3 +51,5 @@ logs/
 .Trashes
 .env
 .env
+trading_bot.db-shm
+trading_bot.db-wal
