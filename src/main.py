@@ -3,6 +3,7 @@
 # Loading env variables from .env
 from pathlib import Path
 from dotenv import load_dotenv
+
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"  # trading-bot/.env
 load_dotenv(dotenv_path=ENV_PATH, override=False)  # loading with explicit path for clarity
 
@@ -12,18 +13,10 @@ from utils import auth
 from utils.logger import logger
 from services import signal_service
 from models.tradingview_signal import TradingviewSignal
-from models.signal import Signal
-from models.bot_trade import BotTrade
-from models.trade_group import TradeGroup
+import models
 from db.database import Base, engine
-from services.trade_lifecycle_mgr import TradeLifeCycleManager
 
 router = APIRouter()
-
-# ----------------------------
-# TradeLifeCycleManager (Background Task)
-# ----------------------------
-trade_lifecycle_manager = TradeLifeCycleManager()
 
 
 @router.post("/webhook/tradingview")
@@ -64,22 +57,14 @@ app = FastAPI()
 app.include_router(router)
 
 # DB-Tabellen erstellen (falls nicht existieren)
+# (Wichtig: das ist ok im API-Prozess; der Worker nutzt dieselbe DB-Datei und greift
+# nur auf existierende Tabellen zu.)
 Base.metadata.create_all(bind=engine)
 
 
-# ----------------------------
-# Startup / Shutdown Hooks
-# ----------------------------
-@app.on_event("startup")
-async def on_startup():
-    logger.info("[APP] startup: starting TradeLifeCycleManager")
-    trade_lifecycle_manager.start()
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    logger.info("[APP] shutdown: stopping TradeLifeCycleManager")
-    await trade_lifecycle_manager.stop()
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":

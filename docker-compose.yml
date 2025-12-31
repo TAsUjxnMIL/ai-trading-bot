@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    working_dir: /app/src
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      - PYTHONPATH=/app/src
+    env_file:
+      - ./.env
+    ports:
+       - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data
+
+  worker:
+    build: .
+    working_dir: /app/src
+    command: ["python", "worker.py"]
+    environment:
+      - PYTHONPATH=/app/src
+    env_file:
+      - ./.env
+    volumes:
+      - ./data:/app/data
