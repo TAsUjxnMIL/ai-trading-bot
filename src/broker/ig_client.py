@@ -67,6 +67,9 @@ class IGClient:
         if self.acc_number:
             self.ig.switch_account(self.acc_number, default_account=False)
 
+    # ----------------------------
+    # Helpers
+    # ----------------------------
     @staticmethod
     def _symbol_to_epic(symbol: str) -> str:
         symbol = symbol.upper()
@@ -125,7 +128,7 @@ class IGClient:
 
         if direction == "BUY":
             level = offer + buffer
-            # safety: BUYZ MUST be >= current offer
+            # safety: BUY MUST be >= current offer
             if level < offer:
                 level = offer + buffer
         else:
@@ -137,6 +140,67 @@ class IGClient:
         # snap to tick
         return round(level / tick) * tick
 
+    # ----------------------------
+    # NEW: market snapshot + rules (for SL clamping)
+    # ----------------------------
+    def _get_market_snapshot_and_rules(self, epic: str) -> Tuple[float, float, float, str]:
+        """
+        Returns (bid, offer, min_step_distance, market_status).
+        Raises MarketClosedError if not tradeable / missing quotes.
+        """
+        m = self._ig_call(self.ig.fetch_market_by_epic, epic)
+        snap = self._get_dict_or_attr(m, "snapshot") or {}
+        rules = self._get_dict_or_attr(m, "dealingRules") or {}
+
+        status = self._get_dict_or_attr(snap, "marketStatus")
+        bid = self._get_dict_or_attr(snap, "bid")
+        offer = self._get_dict_or_attr(snap, "offer")
+
+        if status != "TRADEABLE" or bid is None or offer is None:
+            raise MarketClosedError(f"No tradable bid/offer: epic={epic} status={status} bid={bid} offer={offer}")
+
+        bid = float(bid)
+        offer = float(offer)
+
+        msd = self._get_dict_or_attr(rules, "minStepDistance")
+        step = float(msd.get("value")) if isinstance(msd, dict) and msd.get("value") is not None else 0.0
+
+        return bid, offer, step, str(status)
+
+    def _clamp_stop_level(self, epic: str, direction: str, proposed_stop: float) -> float:
+        """
+        Ensure stop is on correct side and respects minStepDistance to reduce IG rejections.
+        direction is the POSITION direction: "BUY" or "SELL".
+        """
+        bid, offer, step, _ = self._get_market_snapshot_and_rules(epic)
+        stop = float(proposed_stop)
+
+        if direction == "SELL":
+            # For a SELL position: stop must be ABOVE current offer + step
+            min_stop = offer + step
+            if stop < min_stop:
+                logger.warning(
+                    f"[IG][CLAMP_SL] SELL stop too close/wrong side. proposed={stop} -> clamped={min_stop} "
+                    f"(offer={offer}, step={step})"
+                )
+                stop = min_stop
+        else:
+            # For a BUY position: stop must be BELOW current bid - step
+            max_stop = bid - step
+            if stop > max_stop:
+                logger.warning(
+                    f"[IG][CLAMP_SL] BUY stop too close/wrong side. proposed={stop} -> clamped={max_stop} "
+                    f"(bid={bid}, step={step})"
+                )
+                stop = max_stop
+
+        # Your system uses 0.1 tick on this Gold epic; keep it consistent
+        stop = round(stop / 0.1) * 0.1
+        return stop
+
+    # ----------------------------
+    # Orders
+    # ----------------------------
     def place_market_order(
         self,
         symbol: str,
@@ -296,6 +360,9 @@ class IGClient:
 
         raise RuntimeError(f"IG order failed after retries: {last_resp}")
 
+    # ----------------------------
+    # Positions / Quotes
+    # ----------------------------
     def get_open_positions(self) -> List[Dict[str, Any]]:
         """
         Robust against sporadic RemoteDisconnected/Connection aborted.
@@ -369,13 +436,47 @@ class IGClient:
             return float(bid)
         return (float(bid) + float(offer)) / 2.0
 
-    def update_stop_loss(self, deal_id: str, new_stop: float, take_profit: Optional[float] = None) -> Dict[str, Any]:
-        return self._ig_call(
+    # ----------------------------
+    # UPDATED: Stop update for BE move
+    # ----------------------------
+    def update_stop_loss(
+        self,
+        deal_id: str,
+        new_stop: float,
+        symbol: Optional[str] = None,
+        direction: Optional[str] = None,  # "BUY" or "SELL" of the position
+        clamp: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Update ONLY the stop level of an existing open position.
+
+        Changes vs old version:
+          - Adds logging (so you SEE if IG accepted/rejected)
+          - Does NOT send limit_level=None (prevents accidentally clearing TP)
+          - Optional clamp to minStepDistance / correct side (reduces rejects)
+        """
+        stop_level = float(new_stop)
+
+        if clamp and symbol and direction in ("BUY", "SELL"):
+            epic = self._symbol_to_epic(symbol)
+            try:
+                stop_level = self._clamp_stop_level(epic, direction, stop_level)
+            except MarketClosedError as e:
+                # If market is not tradeable we still log and attempt update is skipped by caller ideally.
+                # But we keep behavior explicit here.
+                logger.warning(f"[IG][UPDATE_SL] clamp skipped (market closed): {e}")
+
+        logger.warning(f"[IG][UPDATE_SL] deal_id={deal_id} stop_level={stop_level} (raw={new_stop})")
+
+        resp = self._ig_call(
             self.ig.update_open_position,
             deal_id=deal_id,
-            stop_level=float(new_stop),
-            limit_level=float(take_profit) if take_profit is not None else None,
+            stop_level=float(stop_level),
+            # NOTE: limit_level intentionally NOT sent here
         )
+
+        logger.warning(f"[IG][UPDATE_SL] resp deal_id={deal_id}: {resp}")
+        return resp
 
     def get_bid_offer(self, symbol: str) -> Tuple[float, float]:
         epic = self._symbol_to_epic(symbol)
@@ -391,6 +492,9 @@ class IGClient:
 
         return float(bid), float(offer)
 
+    # ----------------------------
+    # Activity
+    # ----------------------------
     def fetch_account_activity(
         self,
         from_date: Optional[datetime] = None,
