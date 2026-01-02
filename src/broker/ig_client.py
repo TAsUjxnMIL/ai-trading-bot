@@ -2,10 +2,12 @@
 
 import os
 import time
-from typing import Optional, Dict, Any, List
-from datetime import datetime, timezone
+import threading
+from typing import Optional, Dict, Any, List, Tuple
+from datetime import datetime
 import requests
-from trading_ig.rest import IGService
+
+from trading_ig.rest import IGService, TokenInvalidException
 
 from utils.logger import logger
 
@@ -13,6 +15,7 @@ from utils.logger import logger
 class MarketClosedError(RuntimeError):
     """Raised when IG returns a market snapshot without tradable bid/offer (e.g., marketStatus=CLOSED)."""
     pass
+
 
 class IGClient:
     """
@@ -54,6 +57,10 @@ class IGClient:
 
         # Create service + login
         self.ig = IGService(self.username, self.password, self.api_key, self.acc_type)
+
+        # Lock to protect session recreation across threads (asyncio.to_thread)
+        self._session_lock = threading.Lock()
+
         self.ig.create_session()
 
         # Optional: ensure correct active account
@@ -75,16 +82,60 @@ class IGClient:
 
     def _recreate_session(self) -> None:
         """
-        Best-effort re-login. Helps if IG drops the connection or session gets weird.
+        Re-login and (optionally) re-select account.
+        IMPORTANT: Do not swallow exceptions; caller logic depends on success/failure.
+        """
+        logger.warning("[IG] recreating session ...")
+        self.ig.create_session()
+        if self.acc_number:
+            self.ig.switch_account(self.acc_number, default_account=False)
+        logger.info("[IG] session recreated")
+
+    def _ig_call(self, fn, *args, **kwargs):
+        """
+        Wrapper that refreshes IG session exactly once on TokenInvalidException and retries.
+        Thread-safe via _session_lock (because we call this via asyncio.to_thread).
         """
         try:
-            logger.warning("[IG] recreating session ...")
-            self.ig.create_session()
-            if self.acc_number:
-                self.ig.switch_account(self.acc_number, default_account=False)
-            logger.info("[IG] session recreated")
-        except Exception as e:
-            logger.exception(f"[IG] failed to recreate session: {e}")
+            return fn(*args, **kwargs)
+        except TokenInvalidException:
+            logger.warning("[IG] Token invalid -> refresh and retry")
+            with self._session_lock:
+                self._recreate_session()
+            return fn(*args, **kwargs)
+
+    @staticmethod
+    def _get_dict_or_attr(obj: Any, key: str, default=None):
+        if obj is None:
+            return default
+        if hasattr(obj, "get"):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def _compute_marketable_level(self, direction: str, bid: float, offer: float) -> float:
+        """
+        Compute a marketable LIMIT level that stays on the correct side even with small quote moves.
+        For this Gold epic you were rounding to 0.1, so we keep tick=0.1.
+        """
+        tick = 0.1
+        spread = max(0.0, offer - bid)
+
+        # dynamic buffer: at least 0.5, else 3*spread + 1 tick
+        buffer = max(0.5, spread * 3.0 + tick)
+
+        if direction == "BUY":
+            level = offer + buffer
+            # safety: BUYZ MUST be >= current offer
+            if level < offer:
+                level = offer + buffer
+        else:
+            level = bid - buffer
+            # safety: SELL MUST be <= current bid
+            if level > bid:
+                level = bid - buffer
+
+        # snap to tick
+        return round(level / tick) * tick
 
     def place_market_order(
         self,
@@ -98,35 +149,30 @@ class IGClient:
         """
         Despite the name, we DO NOT use IG 'MARKET' orders (too often rejected with MARKET_ROLLED).
         We place a 'marketable LIMIT' with FILL_OR_KILL:
-          - BUY  -> LIMIT at (offer + small buffer)
-          - SELL -> LIMIT at (bid - small buffer)
+          - BUY  -> LIMIT at (offer + buffer)
+          - SELL -> LIMIT at (bid - buffer)
 
         TP/SL are expected as absolute price levels from your trade engine.
-        We convert them into limit_distance / stop_distance (because your trading-ig signature requires them).
+        We convert them into limit_distance / stop_distance.
         """
         epic = self._symbol_to_epic(symbol)
         direction = "BUY" if side.lower() in ("buy", "long") else "SELL"
 
         # 1) Fetch market details (truth source)
-        market = self.ig.fetch_market_by_epic(epic)
+        market = self._ig_call(self.ig.fetch_market_by_epic, epic)
 
-        # IG returns either dict or object with attributes depending on version
-        # 1.) market is dict-like and contains the method get as an attribute
-        # 2.) market is an object with attributes (e.g. instrument, snapshot, dealingRules)
-        instrument = market.get("instrument") if hasattr(market, "get") else getattr(market, "instrument", None)
-        snapshot = market.get("snapshot") if hasattr(market, "get") else getattr(market, "snapshot", None)
-        rules = market.get("dealingRules") if hasattr(market, "get") else getattr(market, "dealingRules", None)
+        instrument = self._get_dict_or_attr(market, "instrument")
+        snapshot = self._get_dict_or_attr(market, "snapshot")
+        rules = self._get_dict_or_attr(market, "dealingRules")
 
         if instrument is None or snapshot is None:
             raise RuntimeError(f"IG market response missing instrument/snapshot for epic={epic}: {market}")
 
-        expiry = (instrument.get("expiry") if hasattr(instrument, "get") else getattr(instrument, "expiry", None)) or "-"
-        status = (snapshot.get("marketStatus") if hasattr(snapshot, "get") else getattr(snapshot, "marketStatus", None))
+        expiry = (self._get_dict_or_attr(instrument, "expiry") or "-")
+        status = self._get_dict_or_attr(snapshot, "marketStatus")
 
-        # Goldhändler sagt ich kaufe zu dem Preis von Bid: Also wenn ich verkaufe, bekomm ich den Preis
-        bid = snapshot.get("bid") if hasattr(snapshot, "get") else getattr(snapshot, "bid", None)
-        # Goldhändler sagt ich verkaufe zu dem Preis von Offer: Also wenn ich kaufe, bezahle ich den Preis
-        offer = snapshot.get("offer") if hasattr(snapshot, "get") else getattr(snapshot, "offer", None)
+        bid = self._get_dict_or_attr(snapshot, "bid")
+        offer = self._get_dict_or_attr(snapshot, "offer")
 
         logger.info(f"[IG] epic={epic} ... bid={bid} offer={offer} ...")
 
@@ -142,8 +188,12 @@ class IGClient:
         min_deal = None
         min_step_dist = None
         if rules is not None:
-            min_deal = (rules.get("minDealSize") or {}).get("value") if hasattr(rules, "get") else None
-            min_step_dist = (rules.get("minStepDistance") or {}).get("value") if hasattr(rules, "get") else None
+            mds = self._get_dict_or_attr(rules, "minDealSize")
+            msd = self._get_dict_or_attr(rules, "minStepDistance")
+            if isinstance(mds, dict):
+                min_deal = mds.get("value")
+            if isinstance(msd, dict):
+                min_step_dist = msd.get("value")
 
         if min_deal is not None and size < float(min_deal):
             raise RuntimeError(f"size={size} is below minDealSize={min_deal} for epic={epic}")
@@ -154,23 +204,8 @@ class IGClient:
             f"minDealSize={min_deal} minStepDistance={step}"
         )
 
-        # Explanaton of LIMIT, FILL_OR_KILL, marketable limit:
-        # LIMIT ORDER: 
-        #   BUY LIMIT: order will only execute at limit price or lower -> Ich kaufe nicht teurer als den Limitpreis
-        #   SELL LIMIT: order will only execute at limit price or higher -> Ich verkaufe nicht billiger als den Limitpreis
-        # FILL_OR_KILL: either fully executed immediately at the limit price (or better) or cancelled
-        # Marketable LIMIT:
-        #   BUY: set limit slightly above current offer -> sofortige Ausführung
-        #   SELL: set limit slightly below current bid -> sofortige Ausführung
-        # This is what we do with order_level below.
-        tick = 0.1
-        buffer_ticks = 5  # 0.5
-        if direction == "BUY":
-            order_level = round(offer + buffer_ticks * tick, 1)
-            entry_ref = offer
-        else:
-            order_level = round(bid - buffer_ticks * tick, 1)
-            entry_ref = bid
+        # entry_ref for distance calculations: BUY uses offer, SELL uses bid
+        entry_ref = offer if direction == "BUY" else bid
 
         stop_distance = None
         limit_distance = None
@@ -202,7 +237,29 @@ class IGClient:
         last_resp: Optional[Dict[str, Any]] = None
 
         for attempt in range(1, max_retries + 1):
-            resp = self.ig.create_open_position(
+            # 🔁 refresh quote each attempt -> prevents WRONG_SIDE_OF_MARKET due to drift
+            m2 = self._ig_call(self.ig.fetch_market_by_epic, epic)
+            snap2 = self._get_dict_or_attr(m2, "snapshot")
+            bid2 = self._get_dict_or_attr(snap2, "bid")
+            offer2 = self._get_dict_or_attr(snap2, "offer")
+            status2 = self._get_dict_or_attr(snap2, "marketStatus")
+
+            if status2 != "TRADEABLE":
+                raise RuntimeError(f"Market not tradeable (attempt={attempt}): epic={epic} status={status2}")
+
+            if bid2 is None or offer2 is None:
+                raise RuntimeError(f"Missing bid/offer (attempt={attempt}) for epic={epic}. bid={bid2} offer={offer2}")
+
+            bid2 = float(bid2)
+            offer2 = float(offer2)
+            order_level = self._compute_marketable_level(direction, bid2, offer2)
+
+            logger.info(
+                f"[IG] attempt={attempt} epic={epic} direction={direction} bid={bid2} offer={offer2} order_level={order_level}"
+            )
+
+            resp = self._ig_call(
+                self.ig.create_open_position,
                 currency_code=currency,
                 direction=direction,
                 epic=epic,
@@ -213,10 +270,8 @@ class IGClient:
                 level=order_level,  # marketable limit
                 time_in_force="FILL_OR_KILL",
                 size=size,
-
                 stop_distance=stop_distance,
                 limit_distance=limit_distance,
-
                 stop_level=None,
                 limit_level=None,
                 quote_id=None,
@@ -232,7 +287,8 @@ class IGClient:
             if deal_status == "ACCEPTED":
                 return resp
 
-            if reason == "MARKET_ROLLED" and attempt < max_retries:
+            # retry on these transient/quote-drift reasons
+            if reason in ("MARKET_ROLLED", "LIMIT_ORDER_WRONG_SIDE_OF_MARKET") and attempt < max_retries:
                 time.sleep(sleep_s)
                 continue
 
@@ -244,8 +300,8 @@ class IGClient:
         """
         Robust against sporadic RemoteDisconnected/Connection aborted.
         Strategy:
-          1) Retry a few times with exponential backoff (no re-login)
-          2) If still failing: recreate session once + do one final attempt
+          1) Retry a few times with exponential backoff
+          2) Token invalid handled by _ig_call()
         """
         max_retries = 5
         base_sleep = 0.5
@@ -263,10 +319,9 @@ class IGClient:
 
         last_err: Optional[Exception] = None
 
-        # 1) Normal retries (no session recreation)
         for attempt in range(1, max_retries + 1):
             try:
-                pos = self.ig.fetch_open_positions()
+                pos = self._ig_call(self.ig.fetch_open_positions)
                 return _normalize(pos)
 
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
@@ -288,27 +343,19 @@ class IGClient:
                     continue
                 raise
 
-        # 2) If still failing: recreate session once + final attempt
-        logger.warning(f"[IG] fetch_open_positions still failing after retries -> recreating session once. last_err={last_err}")
-        self._recreate_session()
-
-        try:
-            pos = self.ig.fetch_open_positions()
-            return _normalize(pos)
-        except Exception as e:
-            raise RuntimeError(f"IG fetch_open_positions failed after retries + session recreate: {e}") from e
+        raise RuntimeError(f"IG fetch_open_positions failed after retries. last_err={last_err}")
 
     def get_current_price(self, symbol: str) -> float:
         epic = self._symbol_to_epic(symbol)
-        market = self.ig.fetch_market_by_epic(epic)
+        market = self._ig_call(self.ig.fetch_market_by_epic, epic)
 
-        snapshot = market.get("snapshot") if hasattr(market, "get") else getattr(market, "snapshot", None)
+        snapshot = self._get_dict_or_attr(market, "snapshot")
         if snapshot is None:
             raise RuntimeError(f"Market snapshot missing: {market}")
 
-        status = snapshot.get("marketStatus") if hasattr(snapshot, "get") else getattr(snapshot, "marketStatus", None)
-        bid = snapshot.get("bid") if hasattr(snapshot, "get") else getattr(snapshot, "bid", None)
-        offer = snapshot.get("offer") if hasattr(snapshot, "get") else getattr(snapshot, "offer", None)
+        status = self._get_dict_or_attr(snapshot, "marketStatus")
+        bid = self._get_dict_or_attr(snapshot, "bid")
+        offer = self._get_dict_or_attr(snapshot, "offer")
 
         # Minimal but robust handling for CLOSED / not quoted markets
         if status != "TRADEABLE" or (bid is None and offer is None):
@@ -323,26 +370,26 @@ class IGClient:
         return (float(bid) + float(offer)) / 2.0
 
     def update_stop_loss(self, deal_id: str, new_stop: float, take_profit: Optional[float] = None) -> Dict[str, Any]:
-        return self.ig.update_open_position(
+        return self._ig_call(
+            self.ig.update_open_position,
             deal_id=deal_id,
             stop_level=float(new_stop),
             limit_level=float(take_profit) if take_profit is not None else None,
         )
 
-    def get_bid_offer(self, symbol: str) -> tuple[float, float]:
+    def get_bid_offer(self, symbol: str) -> Tuple[float, float]:
         epic = self._symbol_to_epic(symbol)
-        market = self.ig.fetch_market_by_epic(epic)
-        snapshot = market.get("snapshot", {}) or {}
+        market = self._ig_call(self.ig.fetch_market_by_epic, epic)
 
-        status = snapshot.get("marketStatus")
-        bid = snapshot.get("bid")
-        offer = snapshot.get("offer")
+        snapshot = self._get_dict_or_attr(market, "snapshot") or {}
+        status = self._get_dict_or_attr(snapshot, "marketStatus")
+        bid = self._get_dict_or_attr(snapshot, "bid")
+        offer = self._get_dict_or_attr(snapshot, "offer")
 
         if status != "TRADEABLE" or bid is None or offer is None:
             raise MarketClosedError(f"No tradable bid/offer: epic={epic} status={status} bid={bid} offer={offer}")
 
         return float(bid), float(offer)
-    
 
     def fetch_account_activity(
         self,
@@ -353,20 +400,16 @@ class IGClient:
     ) -> List[Dict[str, Any]]:
         """
         Returns raw account activity entries as List[Dict[str, Any]].
-
         Note: trading-ig may return a DataFrame-like object; we normalize to list-of-dicts.
         """
-
-        # trading-ig signature may differ slightly; the common one is:
-        # fetch_account_activity_by_date(from_date, to_date, detailed=False, page_size=20, ...)
-        resp = self.ig.fetch_account_activity(
+        resp = self._ig_call(
+            self.ig.fetch_account_activity,
             from_date=from_date,
             to_date=to_date,
             detailed=detailed,
             page_size=page_size,
         )
 
-        # Normalize to list[dict]
         if resp is None:
             return []
 
@@ -375,19 +418,16 @@ class IGClient:
             try:
                 return resp.to_dict(orient="records")
             except TypeError:
-                # some pandas versions don't support orient kw the same way
                 return list(resp.to_dict().values())
 
-        # Already list of dicts
         if isinstance(resp, list):
             return [x for x in resp if isinstance(x, dict)]
 
-        # Some versions return {"activities": [...]} or similar
         if isinstance(resp, dict):
             for key in ("activities", "activity", "data"):
                 v = resp.get(key)
                 if isinstance(v, list):
                     return [x for x in v if isinstance(x, dict)]
-            # fallback: single dict entry
             return []
+
         return []
