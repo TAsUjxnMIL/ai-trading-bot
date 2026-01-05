@@ -113,7 +113,6 @@ class IGClient:
             return True
         if "error.security.client-token-invalid" in msg:
             return True
-        # some variants:
         if "token" in msg and "invalid" in msg and "security" in msg:
             return True
         return False
@@ -124,8 +123,7 @@ class IGClient:
           - executes IG call
           - on TokenInvalidException (or 401 client-token-invalid-like error), hard-recreates session ONCE and retries
           - logs enough context to debug
-        Thread-safe: only the session recreate is locked; we also do a "double-check" so
-        multiple threads don't keep re-refreshing.
+        Thread-safe: only the session recreate is locked.
         """
         call_name = getattr(fn, "__name__", str(fn))
 
@@ -136,15 +134,11 @@ class IGClient:
             logger.warning(f"[IG][CALL] TokenInvalidException in {call_name}: {e} -> refresh+retry")
 
             with self._session_lock:
-                # Another thread might already have refreshed; we still do a hard refresh here,
-                # because TokenInvalidException means this thread used a bad token.
                 self._recreate_session_hard()
 
-            # retry once
             return fn(*args, **kwargs)
 
         except Exception as e:
-            # Catch the "401 client-token-invalid" that is not mapped to TokenInvalidException
             if self._looks_like_client_token_invalid(e):
                 logger.warning(f"[IG][CALL] token invalid (generic) in {call_name}: {e} -> refresh+retry")
 
@@ -153,7 +147,6 @@ class IGClient:
 
                 return fn(*args, **kwargs)
 
-            # otherwise bubble up
             raise
 
     # ----------------------------
@@ -181,14 +174,8 @@ class IGClient:
         return getattr(obj, key, default)
 
     def _compute_marketable_level(self, direction: str, bid: float, offer: float) -> float:
-        """
-        Compute a marketable LIMIT level that stays on the correct side even with small quote moves.
-        For this Gold epic you were rounding to 0.1, so we keep tick=0.1.
-        """
         tick = 0.1
         spread = max(0.0, offer - bid)
-
-        # dynamic buffer: at least 0.5, else 3*spread + 1 tick
         buffer = max(0.5, spread * 3.0 + tick)
 
         if direction == "BUY":
@@ -206,10 +193,6 @@ class IGClient:
     # Market snapshot + rules (for SL clamping)
     # ----------------------------
     def _get_market_snapshot_and_rules(self, epic: str) -> Tuple[float, float, float, str]:
-        """
-        Returns (bid, offer, min_step_distance, market_status).
-        Raises MarketClosedError if not tradeable / missing quotes.
-        """
         m = self._ig_call(self.ig.fetch_market_by_epic, epic)
         snap = self._get_dict_or_attr(m, "snapshot") or {}
         rules = self._get_dict_or_attr(m, "dealingRules") or {}
@@ -230,10 +213,6 @@ class IGClient:
         return bid, offer, step, str(status)
 
     def _clamp_stop_level(self, epic: str, direction: str, proposed_stop: float) -> float:
-        """
-        Ensure stop is on correct side and respects minStepDistance to reduce IG rejections.
-        direction is the POSITION direction: "BUY" or "SELL".
-        """
         bid, offer, step, _ = self._get_market_snapshot_and_rules(epic)
         stop = float(proposed_stop)
 
@@ -281,7 +260,6 @@ class IGClient:
         epic = self._symbol_to_epic(symbol)
         direction = "BUY" if side.lower() in ("buy", "long") else "SELL"
 
-        # 1) Fetch market details (truth source)
         market = self._ig_call(self.ig.fetch_market_by_epic, epic)
 
         instrument = self._get_dict_or_attr(market, "instrument")
@@ -326,7 +304,6 @@ class IGClient:
             f"[IG][ORDER] epic={epic} bid={bid} offer={offer} minDealSize={min_deal} minStepDistance={step}"
         )
 
-        # entry_ref for distance calculations: BUY uses offer, SELL uses bid
         entry_ref = offer if direction == "BUY" else bid
 
         stop_distance = None
@@ -353,7 +330,6 @@ class IGClient:
         last_resp: Optional[Dict[str, Any]] = None
 
         for attempt in range(1, max_retries + 1):
-            # Refresh quote each attempt to avoid WRONG_SIDE due to drift
             m2 = self._ig_call(self.ig.fetch_market_by_epic, epic)
             snap2 = self._get_dict_or_attr(m2, "snapshot") or {}
             bid2 = self._get_dict_or_attr(snap2, "bid")
@@ -401,7 +377,9 @@ class IGClient:
             deal_status = last_resp.get("dealStatus")
             reason = last_resp.get("reason")
 
-            logger.warning(f"[IG][ORDER] response attempt={attempt}: dealStatus={deal_status} reason={reason} resp={last_resp}")
+            logger.warning(
+                f"[IG][ORDER] response attempt={attempt}: dealStatus={deal_status} reason={reason} resp={last_resp}"
+            )
 
             if deal_status == "ACCEPTED":
                 return last_resp
@@ -418,12 +396,6 @@ class IGClient:
     # Positions / Quotes
     # ----------------------------
     def get_open_positions(self) -> List[Dict[str, Any]]:
-        """
-        Robust against sporadic RemoteDisconnected/Connection aborted.
-        Strategy:
-          1) Retry a few times with exponential backoff
-          2) Token invalid handled by _ig_call()
-        """
         max_retries = 5
         base_sleep = 0.5
 
@@ -498,12 +470,14 @@ class IGClient:
         self,
         deal_id: str,
         new_stop: float,
+        take_profit: Optional[float] = None,   # ✅ 3rd param matches broker_client
         symbol: Optional[str] = None,
-        direction: Optional[str] = None,  # "BUY" or "SELL" of the position
+        direction: Optional[str] = None,       # "BUY" or "SELL"
         clamp: bool = True,
     ) -> Dict[str, Any]:
         stop_level = float(new_stop)
 
+        # Optional clamp (only works if symbol+direction are provided)
         if clamp and symbol and direction in ("BUY", "SELL"):
             epic = self._symbol_to_epic(symbol)
             try:
@@ -511,17 +485,21 @@ class IGClient:
             except MarketClosedError as e:
                 logger.warning(f"[IG][UPDATE_SL] clamp skipped (market closed): {e}")
 
-        logger.warning(f"[IG][UPDATE_SL] deal_id={deal_id} stop_level={stop_level} (raw={new_stop})")
+        logger.warning(
+            f"[IG][UPDATE_SL] deal_id={deal_id} stop_level={stop_level} take_profit={take_profit}"
+        )
 
+        # ✅ CRITICAL: this trading-ig version REQUIRES limit_level argument
         resp = self._ig_call(
             self.ig.update_open_position,
-            deal_id=deal_id,
-            stop_level=float(stop_level),
-            # NOTE: limit_level intentionally NOT sent here
+            deal_id,
+            float(stop_level),
+            take_profit,  # ✅ passed as limit_level (keeps TP unchanged)
         )
 
         logger.warning(f"[IG][UPDATE_SL] resp deal_id={deal_id}: {resp}")
         return resp
+
 
     def get_bid_offer(self, symbol: str) -> Tuple[float, float]:
         epic = self._symbol_to_epic(symbol)
@@ -547,10 +525,6 @@ class IGClient:
         detailed: bool = True,
         page_size: int = 500,
     ) -> List[Dict[str, Any]]:
-        """
-        Returns raw account activity entries as List[Dict[str, Any]].
-        Note: trading-ig may return a DataFrame-like object; we normalize to list-of-dicts.
-        """
         resp = self._ig_call(
             self.ig.fetch_account_activity,
             from_date=from_date,
