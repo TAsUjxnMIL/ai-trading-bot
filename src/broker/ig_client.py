@@ -3,10 +3,10 @@
 import os
 import time
 import threading
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 from datetime import datetime
-import requests
 
+import requests
 from trading_ig.rest import IGService, TokenInvalidException
 
 from utils.logger import logger
@@ -42,7 +42,6 @@ class IGClient:
         self.api_key = api_key or os.getenv("IG_SERVICE_API_KEY") or os.getenv("IG_API_KEY")
 
         raw_acc_type = (acc_type or os.getenv("IG_SERVICE_ACC_TYPE") or os.getenv("IG_ENV") or "DEMO").upper()
-        # normalize common values
         if raw_acc_type in ("PRACTICE", "DEMO"):
             self.acc_type = "DEMO"
         elif raw_acc_type in ("LIVE", "REAL"):
@@ -55,17 +54,107 @@ class IGClient:
         if not self.username or not self.password or not self.api_key:
             raise ValueError("Missing IG credentials (env or constructor args).")
 
-        # Create service + login
-        self.ig = IGService(self.username, self.password, self.api_key, self.acc_type)
-
-        # Lock to protect session recreation across threads (asyncio.to_thread)
+        # Lock protects *session recreation + swap of self.ig* across threads (asyncio.to_thread)
         self._session_lock = threading.Lock()
 
-        self.ig.create_session()
+        # Create service + login (hard init)
+        self.ig = self._new_service()
+        self._create_session_initial()
 
-        # Optional: ensure correct active account
+    # ----------------------------
+    # Internal: service/session
+    # ----------------------------
+    def _new_service(self) -> IGService:
+        """
+        Create a NEW IGService instance.
+        Important for robustness: after certain 401/token states, reusing the same IGService
+        instance can keep stale headers internally. Hard-recreate fixes that.
+        """
+        return IGService(self.username, self.password, self.api_key, self.acc_type)
+
+    def _create_session_initial(self) -> None:
+        logger.info(
+            f"[IG][INIT] creating session acc_type={self.acc_type} "
+            f"acc_number={'set' if self.acc_number else 'none'}"
+        )
+        self.ig.create_session()
         if self.acc_number:
             self.ig.switch_account(self.acc_number, default_account=False)
+        logger.info("[IG][INIT] session ready")
+
+    def _recreate_session_hard(self) -> None:
+        """
+        HARD re-login:
+          - create a fresh IGService instance
+          - create_session
+          - (optional) switch_account
+        Do not swallow exceptions; caller depends on success/failure.
+        """
+        logger.warning("[IG][SESSION] hard recreate session ...")
+
+        # replace the service object completely (key fix)
+        self.ig = self._new_service()
+        self.ig.create_session()
+
+        if self.acc_number:
+            self.ig.switch_account(self.acc_number, default_account=False)
+
+        logger.info("[IG][SESSION] hard recreate done")
+
+    @staticmethod
+    def _looks_like_client_token_invalid(exc: Exception) -> bool:
+        """
+        trading-ig can raise TokenInvalidException, but sometimes a 401 shows up as a generic
+        HTTPError/Exception with text like 'error.security.client-token-invalid'.
+        We detect these and refresh once.
+        """
+        msg = str(exc).lower()
+        if "client-token-invalid" in msg:
+            return True
+        if "error.security.client-token-invalid" in msg:
+            return True
+        # some variants:
+        if "token" in msg and "invalid" in msg and "security" in msg:
+            return True
+        return False
+
+    def _ig_call(self, fn: Callable, *args, **kwargs):
+        """
+        Wrapper that:
+          - executes IG call
+          - on TokenInvalidException (or 401 client-token-invalid-like error), hard-recreates session ONCE and retries
+          - logs enough context to debug
+        Thread-safe: only the session recreate is locked; we also do a "double-check" so
+        multiple threads don't keep re-refreshing.
+        """
+        call_name = getattr(fn, "__name__", str(fn))
+
+        try:
+            return fn(*args, **kwargs)
+
+        except TokenInvalidException as e:
+            logger.warning(f"[IG][CALL] TokenInvalidException in {call_name}: {e} -> refresh+retry")
+
+            with self._session_lock:
+                # Another thread might already have refreshed; we still do a hard refresh here,
+                # because TokenInvalidException means this thread used a bad token.
+                self._recreate_session_hard()
+
+            # retry once
+            return fn(*args, **kwargs)
+
+        except Exception as e:
+            # Catch the "401 client-token-invalid" that is not mapped to TokenInvalidException
+            if self._looks_like_client_token_invalid(e):
+                logger.warning(f"[IG][CALL] token invalid (generic) in {call_name}: {e} -> refresh+retry")
+
+                with self._session_lock:
+                    self._recreate_session_hard()
+
+                return fn(*args, **kwargs)
+
+            # otherwise bubble up
+            raise
 
     # ----------------------------
     # Helpers
@@ -82,30 +171,6 @@ class IGClient:
         if step <= 0:
             return value
         return round(value / step) * step
-
-    def _recreate_session(self) -> None:
-        """
-        Re-login and (optionally) re-select account.
-        IMPORTANT: Do not swallow exceptions; caller logic depends on success/failure.
-        """
-        logger.warning("[IG] recreating session ...")
-        self.ig.create_session()
-        if self.acc_number:
-            self.ig.switch_account(self.acc_number, default_account=False)
-        logger.info("[IG] session recreated")
-
-    def _ig_call(self, fn, *args, **kwargs):
-        """
-        Wrapper that refreshes IG session exactly once on TokenInvalidException and retries.
-        Thread-safe via _session_lock (because we call this via asyncio.to_thread).
-        """
-        try:
-            return fn(*args, **kwargs)
-        except TokenInvalidException:
-            logger.warning("[IG] Token invalid -> refresh and retry")
-            with self._session_lock:
-                self._recreate_session()
-            return fn(*args, **kwargs)
 
     @staticmethod
     def _get_dict_or_attr(obj: Any, key: str, default=None):
@@ -128,20 +193,17 @@ class IGClient:
 
         if direction == "BUY":
             level = offer + buffer
-            # safety: BUY MUST be >= current offer
             if level < offer:
                 level = offer + buffer
         else:
             level = bid - buffer
-            # safety: SELL MUST be <= current bid
             if level > bid:
                 level = bid - buffer
 
-        # snap to tick
         return round(level / tick) * tick
 
     # ----------------------------
-    # NEW: market snapshot + rules (for SL clamping)
+    # Market snapshot + rules (for SL clamping)
     # ----------------------------
     def _get_market_snapshot_and_rules(self, epic: str) -> Tuple[float, float, float, str]:
         """
@@ -176,7 +238,6 @@ class IGClient:
         stop = float(proposed_stop)
 
         if direction == "SELL":
-            # For a SELL position: stop must be ABOVE current offer + step
             min_stop = offer + step
             if stop < min_stop:
                 logger.warning(
@@ -185,7 +246,6 @@ class IGClient:
                 )
                 stop = min_stop
         else:
-            # For a BUY position: stop must be BELOW current bid - step
             max_stop = bid - step
             if stop > max_stop:
                 logger.warning(
@@ -194,7 +254,6 @@ class IGClient:
                 )
                 stop = max_stop
 
-        # Your system uses 0.1 tick on this Gold epic; keep it consistent
         stop = round(stop / 0.1) * 0.1
         return stop
 
@@ -238,7 +297,7 @@ class IGClient:
         bid = self._get_dict_or_attr(snapshot, "bid")
         offer = self._get_dict_or_attr(snapshot, "offer")
 
-        logger.info(f"[IG] epic={epic} ... bid={bid} offer={offer} ...")
+        logger.info(f"[IG][ORDER] epic={epic} dir={direction} status={status} bid={bid} offer={offer} expiry={expiry}")
 
         if status != "TRADEABLE":
             raise RuntimeError(f"Market not tradeable: epic={epic} status={status}")
@@ -264,8 +323,7 @@ class IGClient:
 
         step = float(min_step_dist) if min_step_dist is not None else 0.0
         logger.info(
-            f"[IG] epic={epic} expiry={expiry} status={status} bid={bid} offer={offer} "
-            f"minDealSize={min_deal} minStepDistance={step}"
+            f"[IG][ORDER] epic={epic} bid={bid} offer={offer} minDealSize={min_deal} minStepDistance={step}"
         )
 
         # entry_ref for distance calculations: BUY uses offer, SELL uses bid
@@ -276,10 +334,7 @@ class IGClient:
 
         if stop_loss is not None:
             sl = float(stop_loss)
-            if direction == "BUY":
-                stop_distance = entry_ref - sl
-            else:
-                stop_distance = sl - entry_ref
+            stop_distance = (entry_ref - sl) if direction == "BUY" else (sl - entry_ref)
             if stop_distance <= 0:
                 raise RuntimeError(f"Invalid stop_loss for {direction}: stop_loss={sl} entry_ref={entry_ref}")
             if step:
@@ -287,10 +342,7 @@ class IGClient:
 
         if take_profit is not None:
             tp = float(take_profit)
-            if direction == "BUY":
-                limit_distance = tp - entry_ref
-            else:
-                limit_distance = entry_ref - tp
+            limit_distance = (tp - entry_ref) if direction == "BUY" else (entry_ref - tp)
             if limit_distance <= 0:
                 raise RuntimeError(f"Invalid take_profit for {direction}: take_profit={tp} entry_ref={entry_ref}")
             if step:
@@ -301,16 +353,15 @@ class IGClient:
         last_resp: Optional[Dict[str, Any]] = None
 
         for attempt in range(1, max_retries + 1):
-            # 🔁 refresh quote each attempt -> prevents WRONG_SIDE_OF_MARKET due to drift
+            # Refresh quote each attempt to avoid WRONG_SIDE due to drift
             m2 = self._ig_call(self.ig.fetch_market_by_epic, epic)
-            snap2 = self._get_dict_or_attr(m2, "snapshot")
+            snap2 = self._get_dict_or_attr(m2, "snapshot") or {}
             bid2 = self._get_dict_or_attr(snap2, "bid")
             offer2 = self._get_dict_or_attr(snap2, "offer")
             status2 = self._get_dict_or_attr(snap2, "marketStatus")
 
             if status2 != "TRADEABLE":
                 raise RuntimeError(f"Market not tradeable (attempt={attempt}): epic={epic} status={status2}")
-
             if bid2 is None or offer2 is None:
                 raise RuntimeError(f"Missing bid/offer (attempt={attempt}) for epic={epic}. bid={bid2} offer={offer2}")
 
@@ -319,7 +370,9 @@ class IGClient:
             order_level = self._compute_marketable_level(direction, bid2, offer2)
 
             logger.info(
-                f"[IG] attempt={attempt} epic={epic} direction={direction} bid={bid2} offer={offer2} order_level={order_level}"
+                f"[IG][ORDER] attempt={attempt}/{max_retries} epic={epic} dir={direction} "
+                f"bid={bid2} offer={offer2} level={order_level} "
+                f"stop_dist={stop_distance} limit_dist={limit_distance} size={size}"
             )
 
             resp = self._ig_call(
@@ -331,7 +384,7 @@ class IGClient:
                 force_open=True,
                 guaranteed_stop=False,
                 order_type="LIMIT",
-                level=order_level,  # marketable limit
+                level=order_level,
                 time_in_force="FILL_OR_KILL",
                 size=size,
                 stop_distance=stop_distance,
@@ -344,19 +397,20 @@ class IGClient:
                 session=None,
             )
 
-            last_resp = resp
-            deal_status = resp.get("dealStatus") if isinstance(resp, dict) else None
-            reason = resp.get("reason") if isinstance(resp, dict) else None
+            last_resp = resp if isinstance(resp, dict) else {"resp": str(resp)}
+            deal_status = last_resp.get("dealStatus")
+            reason = last_resp.get("reason")
+
+            logger.warning(f"[IG][ORDER] response attempt={attempt}: dealStatus={deal_status} reason={reason} resp={last_resp}")
 
             if deal_status == "ACCEPTED":
-                return resp
+                return last_resp
 
-            # retry on these transient/quote-drift reasons
             if reason in ("MARKET_ROLLED", "LIMIT_ORDER_WRONG_SIDE_OF_MARKET") and attempt < max_retries:
                 time.sleep(sleep_s)
                 continue
 
-            raise RuntimeError(f"IG order rejected: {resp}")
+            raise RuntimeError(f"IG order rejected: {last_resp}")
 
         raise RuntimeError(f"IG order failed after retries: {last_resp}")
 
@@ -389,13 +443,15 @@ class IGClient:
         for attempt in range(1, max_retries + 1):
             try:
                 pos = self._ig_call(self.ig.fetch_open_positions)
-                return _normalize(pos)
+                out = _normalize(pos)
+                logger.info(f"[IG][OPEN_POS] attempt={attempt} got={len(out)}")
+                return out
 
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 last_err = e
                 sleep = base_sleep * (2 ** (attempt - 1))
                 logger.warning(
-                    f"[IG] fetch_open_positions transient error (attempt {attempt}/{max_retries}): {e} -> sleep {sleep:.2f}s"
+                    f"[IG][OPEN_POS] transient error (attempt {attempt}/{max_retries}): {e} -> sleep {sleep:.2f}s"
                 )
                 time.sleep(sleep)
 
@@ -404,7 +460,7 @@ class IGClient:
                     last_err = e
                     sleep = base_sleep * (2 ** (attempt - 1))
                     logger.warning(
-                        f"[IG] fetch_open_positions disconnect (attempt {attempt}/{max_retries}): {e} -> sleep {sleep:.2f}s"
+                        f"[IG][OPEN_POS] disconnect (attempt {attempt}/{max_retries}): {e} -> sleep {sleep:.2f}s"
                     )
                     time.sleep(sleep)
                     continue
@@ -424,7 +480,6 @@ class IGClient:
         bid = self._get_dict_or_attr(snapshot, "bid")
         offer = self._get_dict_or_attr(snapshot, "offer")
 
-        # Minimal but robust handling for CLOSED / not quoted markets
         if status != "TRADEABLE" or (bid is None and offer is None):
             raise MarketClosedError(
                 f"Missing bid/offer or not tradeable: epic={epic} status={status} bid={bid} offer={offer}"
@@ -437,7 +492,7 @@ class IGClient:
         return (float(bid) + float(offer)) / 2.0
 
     # ----------------------------
-    # UPDATED: Stop update for BE move
+    # Stop update (BE move)
     # ----------------------------
     def update_stop_loss(
         self,
@@ -447,14 +502,6 @@ class IGClient:
         direction: Optional[str] = None,  # "BUY" or "SELL" of the position
         clamp: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Update ONLY the stop level of an existing open position.
-
-        Changes vs old version:
-          - Adds logging (so you SEE if IG accepted/rejected)
-          - Does NOT send limit_level=None (prevents accidentally clearing TP)
-          - Optional clamp to minStepDistance / correct side (reduces rejects)
-        """
         stop_level = float(new_stop)
 
         if clamp and symbol and direction in ("BUY", "SELL"):
@@ -462,8 +509,6 @@ class IGClient:
             try:
                 stop_level = self._clamp_stop_level(epic, direction, stop_level)
             except MarketClosedError as e:
-                # If market is not tradeable we still log and attempt update is skipped by caller ideally.
-                # But we keep behavior explicit here.
                 logger.warning(f"[IG][UPDATE_SL] clamp skipped (market closed): {e}")
 
         logger.warning(f"[IG][UPDATE_SL] deal_id={deal_id} stop_level={stop_level} (raw={new_stop})")
@@ -517,7 +562,6 @@ class IGClient:
         if resp is None:
             return []
 
-        # DataFrame-like
         if hasattr(resp, "to_dict"):
             try:
                 return resp.to_dict(orient="records")
