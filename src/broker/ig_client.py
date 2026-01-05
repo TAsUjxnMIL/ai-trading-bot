@@ -375,7 +375,7 @@ class IGClient:
             try:
                 pos = self._ig_call(self.ig.fetch_open_positions)
                 out = _normalize(pos)
-                logger.info(f"[IG][OPEN_POS] attempt={attempt} got={len(out)}")
+                logger.debug(f"[IG][OPEN_POS] attempt={attempt} got={len(out)}")
                 return out
 
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
