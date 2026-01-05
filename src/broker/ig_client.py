@@ -429,84 +429,12 @@ class IGClient:
 
         return float(bid), float(offer)
 
-    # ----------------------------
-    # Stop update (SAFE: keep TP unchanged)
-    # ----------------------------
-    def update_stop_loss(
-        self,
-        deal_id: str,
-        new_stop: float,
-        take_profit: Optional[float] = None,  # accepted for API compatibility, but NOT used to avoid TP changes
-        clamp: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        IMPORTANT:
-        - trading-ig (your installed version) requires BOTH stop_level and limit_level
-        - To avoid 'invalid.request.limitLevel', we NEVER send TP from DB/strategy.
-          We always keep the CURRENT TP from the live IG position.
-        """
-        # 1) find current position in IG open positions
-        pos_list = self.get_open_positions()
-        pos = None
-        for p in pos_list:
-            if isinstance(p, dict) and str(p.get("dealId")) == str(deal_id):
-                pos = p
-                break
-
-        if not pos:
-            raise RuntimeError(f"[IG][UPDATE_SL] deal_id={deal_id} not found in open positions")
-
-        epic = str(pos.get("epic"))
-        direction = str(pos.get("direction") or "").upper()  # BUY / SELL
-        current_limit = pos.get("limitLevel")
-
-        if current_limit is None:
-            # If you truly have no TP on that position, your trading-ig version can't update SL safely.
-            raise RuntimeError(
-                f"[IG][UPDATE_SL] Position has no limitLevel (TP). "
-                f"Cannot call update_open_position because this trading-ig version requires limit_level. deal_id={deal_id}"
+    def update_stop_loss(self, deal_id: str, new_stop: float, take_profit: Optional[float] = None) -> Dict[str, Any]:
+            return self.ig.update_open_position(
+                deal_id=deal_id,
+                stop_level=float(new_stop),
+                limit_level=float(take_profit) if take_profit is not None else None,
             )
-
-        tick = 0.1
-
-        stop_level = float(new_stop)
-
-        # clamp (uses market snapshot + minStepDistance)
-        if clamp and epic and direction in ("BUY", "SELL"):
-            try:
-                stop_level = self._clamp_stop_level(epic, direction, stop_level)
-            except MarketClosedError as e:
-                logger.warning(f"[IG][UPDATE_SL] clamp skipped (market closed): {e}")
-                # still do a safe rounding below
-
-        # round stop safely:
-        # - BUY => round DOWN (keep stop below market constraints)
-        # - SELL => round UP
-        if direction == "BUY":
-            stop_level = self._round_down_tick(stop_level, tick)
-        else:
-            stop_level = self._round_up_tick(stop_level, tick)
-
-        # limit_level: KEEP EXISTING TP exactly (just tick-normalize to be safe)
-        limit_level = float(current_limit)
-        limit_level = round(limit_level / tick) * tick
-
-        logger.warning(
-            f"[IG][UPDATE_SL] deal_id={deal_id} epic={epic} dir={direction} "
-            f"stop_level={stop_level} limit_level(keep)={limit_level} "
-            f"(raw_stop={new_stop} take_profit_ignored={take_profit} pos_tp={current_limit})"
-        )
-
-        # 2) call IG (positional because your wrapper signature requires limit_level param)
-        resp = self._ig_call(
-            self.ig.update_open_position,
-            deal_id,
-            float(stop_level),
-            float(limit_level),
-        )
-
-        logger.warning(f"[IG][UPDATE_SL] resp deal_id={deal_id}: {resp}")
-        return resp
 
     # ----------------------------
     # Activity
