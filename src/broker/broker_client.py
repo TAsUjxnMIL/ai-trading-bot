@@ -24,8 +24,19 @@ def _create_client_sync():
     """
     global _client
 
+    """
+    if BROKER_MODE == "dummy":
+        logger.info("[BROKER] Using DummyBroker")
+        return DummyBroker()
+
+    if BROKER_MODE == "oanda":
+        logger.info("[BROKER] Using OandaBroker")
+        # return OandaBroker()
+        raise NotImplementedError("OandaBroker not wired yet")
+    """
+
     if BROKER_MODE == "ig":
-        logger.info("[BROKER] Using IGClient")
+        logger.info("[BROKER] Using IGClient (REAL / PRACTICE je nach IG_ENV)")
         return IGClient()
 
     raise ValueError(f"Unknown BROKER_MODE={BROKER_MODE!r}")
@@ -43,6 +54,7 @@ async def _get_client():
         if _client is not None:
             return _client
 
+        # Create in a thread to avoid blocking event loop
         _client = await asyncio.to_thread(_create_client_sync)
         return _client
 
@@ -67,11 +79,7 @@ async def place_market_order(
     return await asyncio.to_thread(fn, symbol, side, size, take_profit, stop_loss)
 
 
-async def update_stop_loss(
-    deal_id: str,
-    new_stop: float,
-    take_profit: Optional[float] = None,  # keep in API; we will pass None from TLM so TP is not touched
-) -> Dict[str, Any]:
+async def update_stop_loss(deal_id: str, new_stop: float, take_profit: Optional[float] = None) -> Dict[str, Any]:
     client = await _get_client()
     fn = getattr(client, "update_stop_loss")
 
@@ -107,6 +115,11 @@ async def fetch_account_activity(
     detailed: bool = True,
     page_size: int = 500,
 ) -> List[Dict[str, Any]]:
+    """
+    Fetch IG account activity as raw JSON list of activity entries.
+
+    from_date/to_date should be datetime objects (ideally UTC).
+    """
     client = await _get_client()
     fn = getattr(client, "fetch_account_activity")
 
@@ -116,19 +129,13 @@ async def fetch_account_activity(
     return await asyncio.to_thread(fn, from_date, to_date, detailed, page_size)
 
 
-async def get_bid_offer(symbol: str):
-    client = await _get_client()
-    fn = getattr(client, "get_bid_offer")
-    if _is_coro(fn):
-        return await fn(symbol)
-    return await asyncio.to_thread(fn, symbol)
-
-
+# Optional: call from FastAPI shutdown if you later add close() on clients.
 async def shutdown():
     global _client
     if _client is None:
         return
 
+    # if your IGClient ever implements close(), call it here
     close_fn = getattr(_client, "close", None)
     if close_fn:
         if _is_coro(close_fn):
@@ -137,3 +144,10 @@ async def shutdown():
             await asyncio.to_thread(close_fn)
 
     _client = None
+
+async def get_bid_offer(symbol: str):
+    client = await _get_client()
+    fn = getattr(client, "get_bid_offer")
+    if _is_coro(fn):
+        return await fn(symbol)
+    return await asyncio.to_thread(fn, symbol)
