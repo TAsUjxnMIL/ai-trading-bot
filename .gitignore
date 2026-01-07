@@ -53,3 +53,8 @@ logs/
 .env
 trading_bot.db-shm
 trading_bot.db-wal
+
+# env files
+.env.demo
+.env.live
+.env
