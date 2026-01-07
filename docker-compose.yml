@@ -6,9 +6,9 @@ services:
     environment:
       - PYTHONPATH=/app/src
     env_file:
-      - ./.env
+      - ${ENV_FILE:-./.env.demo}
     ports:
-       - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     volumes:
       - ./data:/app/data
 
@@ -19,6 +19,6 @@ services:
     environment:
       - PYTHONPATH=/app/src
     env_file:
-      - ./.env
+      - ${ENV_FILE:-./.env.demo}
     volumes:
       - ./data:/app/data
