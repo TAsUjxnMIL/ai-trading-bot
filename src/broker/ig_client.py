@@ -30,6 +30,9 @@ class IGClient:
       IG_SERVICE_ACC_NUMBER (optional)
     """
 
+    # ✅ NEW: deal meta cache TTL (seconds)
+    DEAL_META_TTL_SECONDS = 60.0
+
     def __init__(
         self,
         username: Optional[str] = None,
@@ -56,6 +59,10 @@ class IGClient:
             raise ValueError("Missing IG credentials (env or constructor args).")
 
         self._session_lock = threading.Lock()
+
+        # ✅ NEW: deal_id -> (epic, direction, ts_epoch)
+        # direction here is POSITION direction from IG: "BUY" (long) or "SELL" (short)
+        self._deal_meta_cache: Dict[str, Tuple[str, str, float]] = {}
 
         self.ig = self._new_service()
         self._create_session_initial()
@@ -147,17 +154,14 @@ class IGClient:
 
         if direction == "BUY":
             level = offer + buffer
-            # safety
             if level < offer:
                 level = offer + buffer
-            # marketable buy must be >= offer
             level = max(level, offer + tick)
             return self._round_up_tick(level, tick)
 
         level = bid - buffer
         if level > bid:
             level = bid - buffer
-        # marketable sell must be <= bid
         level = min(level, bid - tick)
         return self._round_down_tick(level, tick)
 
@@ -193,26 +197,75 @@ class IGClient:
         if direction == "BUY":
             max_stop = bid - step
             if stop > max_stop:
-                logger.warning(f"[IG][CLAMP_SL] BUY stop too high. proposed={stop} -> {max_stop} (bid={bid}, step={step})")
+                logger.warning(
+                    f"[IG][CLAMP_SL] BUY stop too high. proposed={stop} -> {max_stop} (bid={bid}, step={step})"
+                )
                 stop = max_stop
-            # round DOWN so we never cross above max_stop due to rounding
             stop = self._round_down_tick(stop, tick)
-            # guard after rounding
             if stop > max_stop:
                 stop = self._round_down_tick(max_stop, tick)
 
         else:  # SELL
             min_stop = offer + step
             if stop < min_stop:
-                logger.warning(f"[IG][CLAMP_SL] SELL stop too low. proposed={stop} -> {min_stop} (offer={offer}, step={step})")
+                logger.warning(
+                    f"[IG][CLAMP_SL] SELL stop too low. proposed={stop} -> {min_stop} (offer={offer}, step={step})"
+                )
                 stop = min_stop
-            # round UP so we never cross below min_stop due to rounding
             stop = self._round_up_tick(stop, tick)
-            # guard after rounding
             if stop < min_stop:
                 stop = self._round_up_tick(min_stop, tick)
 
         return float(round(stop, 2))
+
+    # ✅ NEW: fetch epic+direction for a deal_id (with tiny TTL cache)
+    def _get_deal_meta(self, deal_id: str) -> Optional[Tuple[str, str]]:
+        now = time.time()
+        cached = self._deal_meta_cache.get(str(deal_id))
+        if cached is not None:
+            epic, direction, ts = cached
+            if (now - ts) <= self.DEAL_META_TTL_SECONDS:
+                return epic, direction
+
+        # Not cached or stale -> scan open positions once
+        try:
+            pos = self._ig_call(self.ig.fetch_open_positions)
+        except Exception as e:
+            logger.warning(f"[IG][DEAL_META] fetch_open_positions failed for deal_id={deal_id}: {e}")
+            return None
+
+        rows: List[Dict[str, Any]] = []
+        if hasattr(pos, "to_dict"):
+            try:
+                rows = pos.to_dict(orient="records")
+            except Exception:
+                # some shapes return dict-of-dicts
+                try:
+                    d = pos.to_dict()
+                    rows = list(d.values()) if isinstance(d, dict) else []
+                except Exception:
+                    rows = []
+        elif isinstance(pos, list):
+            rows = [x for x in pos if isinstance(x, dict)]
+        elif isinstance(pos, dict):
+            rows = [pos]
+        else:
+            rows = []
+
+        # IG open positions rows usually include: dealId, epic, direction
+        found_epic = None
+        found_direction = None
+        for r in rows:
+            if str(r.get("dealId")) == str(deal_id):
+                found_epic = r.get("epic")
+                found_direction = (r.get("direction") or "").upper()
+                break
+
+        if not found_epic or found_direction not in ("BUY", "SELL"):
+            return None
+
+        self._deal_meta_cache[str(deal_id)] = (str(found_epic), str(found_direction), now)
+        return str(found_epic), str(found_direction)
 
     # ----------------------------
     # Orders
@@ -338,7 +391,9 @@ class IGClient:
             deal_status = last_resp.get("dealStatus")
             reason = last_resp.get("reason")
 
-            logger.warning(f"[IG][ORDER] response attempt={attempt}: dealStatus={deal_status} reason={reason} resp={last_resp}")
+            logger.warning(
+                f"[IG][ORDER] response attempt={attempt}: dealStatus={deal_status} reason={reason} resp={last_resp}"
+            )
 
             if deal_status == "ACCEPTED":
                 return last_resp
@@ -381,14 +436,18 @@ class IGClient:
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 last_err = e
                 sleep = base_sleep * (2 ** (attempt - 1))
-                logger.warning(f"[IG][OPEN_POS] transient error (attempt {attempt}/{max_retries}): {e} -> sleep {sleep:.2f}s")
+                logger.warning(
+                    f"[IG][OPEN_POS] transient error (attempt {attempt}/{max_retries}): {e} -> sleep {sleep:.2f}s"
+                )
                 time.sleep(sleep)
 
             except Exception as e:
                 if _is_disconnect_exc(e):
                     last_err = e
                     sleep = base_sleep * (2 ** (attempt - 1))
-                    logger.warning(f"[IG][OPEN_POS] disconnect (attempt {attempt}/{max_retries}): {e} -> sleep {sleep:.2f}s")
+                    logger.warning(
+                        f"[IG][OPEN_POS] disconnect (attempt {attempt}/{max_retries}): {e} -> sleep {sleep:.2f}s"
+                    )
                     time.sleep(sleep)
                     continue
                 raise
@@ -407,7 +466,9 @@ class IGClient:
         offer = self._get_dict_or_attr(snapshot, "offer")
 
         if status != "TRADEABLE" or (bid is None and offer is None):
-            raise MarketClosedError(f"Missing bid/offer or not tradeable: epic={epic} status={status} bid={bid} offer={offer}")
+            raise MarketClosedError(
+                f"Missing bid/offer or not tradeable: epic={epic} status={status} bid={bid} offer={offer}"
+            )
 
         if bid is None:
             return float(offer)
@@ -430,11 +491,42 @@ class IGClient:
         return float(bid), float(offer)
 
     def update_stop_loss(self, deal_id: str, new_stop: float, take_profit: Optional[float] = None) -> Dict[str, Any]:
-            return self.ig.update_open_position(
-                deal_id=deal_id,
-                stop_level=float(new_stop),
-                limit_level=float(take_profit) if take_profit is not None else None,
-            )
+        """
+        ✅ Minimal-safe SL update:
+        - resolve (epic, direction) for this deal_id (cached for a short time)
+        - clamp stop to IG rules so we don't get "invalid.request.stopLevel" / "wrong side"
+        - then call update_open_position via _ig_call (token-safe)
+        """
+        proposed = float(new_stop)
+
+        meta = self._get_deal_meta(str(deal_id))
+        if meta is not None:
+            epic, direction = meta
+            try:
+                clamped = self._clamp_stop_level(epic, direction, proposed)
+            except MarketClosedError as e:
+                # If market snapshot isn't tradeable right now, best is: skip changing SL (caller may catch/log)
+                logger.info(f"[IG][UPDATE_SL] market closed while clamping deal_id={deal_id}: {e}")
+                raise
+            except Exception as e:
+                # If clamp fails for any reason, fallback to proposed (don't block) but log clearly
+                logger.warning(f"[IG][UPDATE_SL] clamp failed deal_id={deal_id} proposed={proposed}: {e}")
+                clamped = proposed
+
+            if abs(clamped - proposed) > 1e-9:
+                logger.warning(f"[IG][UPDATE_SL] CLAMP applied deal_id={deal_id}: {proposed} -> {clamped}")
+            stop_level = clamped
+        else:
+            # Can't resolve epic/direction (maybe already closed) -> just try update with proposed
+            logger.warning(f"[IG][UPDATE_SL] no deal meta for deal_id={deal_id} -> update without clamp")
+            stop_level = proposed
+
+        return self._ig_call(
+            self.ig.update_open_position,
+            deal_id=str(deal_id),
+            stop_level=float(stop_level),
+            limit_level=float(take_profit) if take_profit is not None else None,
+        )
 
     # ----------------------------
     # Activity
