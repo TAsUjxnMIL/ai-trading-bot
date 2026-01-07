@@ -35,9 +35,9 @@ STEP_SIZE_POINTS: float = 1.0
 TOTAL_POSITION_SIZE: float = 0.375
 
 # Size-Regeln für dein GOLD-Instrument laut Log:
-# minDealSize=0.1 → typischerweise 0.1 Schritte
-SIZE_STEP: float = 0.1
-MIN_DEAL_SIZE: float = 0.1
+# LIVE GOLD: minDealSize=0.125 (laut IG), sinnvolles step=0.025
+SIZE_STEP: float = 0.025
+MIN_DEAL_SIZE: float = 0.125
 NUM_ORDERS: int = 3
 
 
@@ -128,6 +128,11 @@ def split_total_size(total: float, n: int, step: float, min_size: float) -> List
     if total <= 0:
         raise ValueError("total must be > 0")
 
+    # ✅ Ensure step is compatible with min_size (otherwise we can never hit min_size cleanly)
+    q = min_size / step
+    if abs(q - round(q)) > 1e-6:
+        raise ValueError(f"min_size={min_size} is not a multiple of step={step}. Use a smaller step (e.g. 0.025)")
+
     min_total = n * min_size
     if total + 1e-9 < min_total:
         raise ValueError(
@@ -135,13 +140,13 @@ def split_total_size(total: float, n: int, step: float, min_size: float) -> List
             f"Need at least {min_total}."
         )
 
-    raw = total / n
-    base = _round_down_to_step(raw, step)
-    base = max(base, min_size)
+    # ✅ Start with the minimum on each order (guarantees per-order min)
+    sizes = [min_size] * n
 
-    sizes = [base] * n
+    # remaining amount to distribute on top of min_size blocks
     remaining = round(total - sum(sizes), 10)
 
+    # distribute in step increments round-robin
     i = 0
     while remaining >= (step - 1e-9):
         idx = i % n
@@ -151,13 +156,14 @@ def split_total_size(total: float, n: int, step: float, min_size: float) -> List
         if i > 100000:
             raise RuntimeError("split_total_size: too many iterations (unexpected).")
 
+    # final validation
     sizes = [round(s, 10) for s in sizes]
 
     for s in sizes:
         if s + 1e-9 < min_size:
             raise RuntimeError(f"Computed size {s} < min_size {min_size}")
-        q = s / step
-        if abs(q - round(q)) > 1e-6:
+        q2 = s / step
+        if abs(q2 - round(q2)) > 1e-6:
             raise RuntimeError(f"Computed size {s} is not a multiple of step {step}")
 
     if abs(sum(sizes) - total) > 1e-6:
