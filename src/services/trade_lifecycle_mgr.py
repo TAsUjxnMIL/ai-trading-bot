@@ -4,10 +4,13 @@ import asyncio
 from typing import Dict, Any, List, Optional, Set, Tuple
 import math
 from datetime import datetime, timedelta, timezone
-import os
+import time
+
 from utils.logger import logger
 from broker import broker_client
 from broker.ig_client import MarketClosedError
+
+from trading_ig.rest import ApiExceededException  # ✅ catch IG rate-limit cleanly
 
 from services.trade_engine import compute_step_sl_long, compute_step_sl_short, SL_INITIAL_POINTS
 from services.trade_repo import (
@@ -34,6 +37,11 @@ ACTIVITY_LOOKBACK_MINUTES = 24 * 60  # 24h
 # classification tolerance (XAUUSD-ish)
 CLOSE_EPS = 0.15
 BREAKEVEN_BUFFER = 0.0  # move SL to entry +/- buffer
+
+# ✅ NEW: quote + request protection
+QUOTE_TTL_SECONDS = 10              # reuse cached quote for this long (cuts calls massively)
+SYMBOL_COOLDOWN_SECONDS = 30        # if market not tradeable for symbol -> wait before retry
+RATE_LIMIT_COOLDOWN_SECONDS = 30    # if ApiExceeded -> global cooldown
 
 
 def _opt_float(x: Any) -> Optional[float]:
@@ -93,7 +101,6 @@ def _classify_close_reason(
         candidates.append(("SL", abs(level - stop_level)))
 
     if not candidates:
-        # Wir kennen weder SL noch TP -> können nicht sinnvoll klassifizieren
         return "UNKNOWN"
 
     reason, dist = min(candidates, key=lambda x: x[1])
@@ -101,7 +108,6 @@ def _classify_close_reason(
     if dist <= CLOSE_EPS:
         return reason
 
-    # Close-Level vorhanden, aber weder TP noch SL -> sehr wahrscheinlich manuell geschlossen
     logger.info(
         f"[close_reason] MANUAL level={level} stop={stop_level} limit={limit_level} "
         f"dist_stop={abs(level-stop_level) if stop_level is not None else None} "
@@ -110,19 +116,17 @@ def _classify_close_reason(
     return "MANUAL"
 
 
-
-
 def _extract_position_closed_event(a: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Supports both:
-    (A) flat activity rows (your current logs)
+    (A) flat activity rows
     (B) nested details/actions format
 
     Returns:
       {
-        "event_id": str,      # unique id of close event (activity dealId)
-        "pos_deal_id": str,   # affectedDealId (join key to BotTrade.deal_id)
-        "level": float|None,  # close level
+        "event_id": str,
+        "pos_deal_id": str,
+        "level": float|None,
         "stopLevel": float|None,
         "limitLevel": float|None,
         "date": str|None
@@ -181,15 +185,19 @@ def _extract_position_closed_event(a: Dict[str, Any]) -> Optional[Dict[str, Any]
     }
 
 
-
 class TradeLifeCycleManager:
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._last_sl_by_deal: Dict[str, float] = {}
 
-        # ✅ in-memory dedupe; later move to DB: dedupe: find and remove redundant processing of same close event
+        # ✅ in-memory dedupe
         self._processed_close_events: Set[str] = set()
+
+        # ✅ NEW: cross-tick quote cache + throttles
+        self._quote_cache: Dict[str, Tuple[float, float]] = {}  # symbol -> (price, ts_epoch)
+        self._symbol_skip_until: Dict[str, float] = {}          # symbol -> ts_epoch
+        self._rate_limited_until: float = 0.0                   # global ts_epoch
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -216,20 +224,14 @@ class TradeLifeCycleManager:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                # Only unexpected errors should land here now.
                 logger.exception(f"[TradeLifeCycleManager] loop error: {e}")
                 await asyncio.sleep(ERROR_BACKOFF)
 
     async def _process_closed_deals_tp_hit(self, closed_ids: Set[str]) -> None:
-        """
-        For deals that just got detected as closed, look up the matching POSITION_CLOSED
-        account activity event, classify TP vs SL, persist close metadata (price + reason),
-        and if it's TP:
-        - tp_index=1 -> move SL of remaining trades to BE (entry +/- buffer)
-        - tp_index=2 -> move SL of remaining trades to TP1 price
-        """
         if not closed_ids:
             return
-        
+
         now_utc = datetime.now(timezone.utc)
         from_utc = now_utc - timedelta(minutes=ACTIVITY_LOOKBACK_MINUTES)
 
@@ -242,7 +244,6 @@ class TradeLifeCycleManager:
         if not activities:
             return
 
-        # index close events by position deal id
         closes_by_pos: Dict[str, Dict[str, Any]] = {}
         for a in activities:
             ev = _extract_position_closed_event(a)
@@ -253,7 +254,6 @@ class TradeLifeCycleManager:
             if ev["event_id"] in self._processed_close_events:
                 continue
 
-            # keep the most recent event if multiple show up (rare, but safer)
             closes_by_pos[ev["pos_deal_id"]] = ev
 
         for pos_deal_id in closed_ids:
@@ -268,10 +268,8 @@ class TradeLifeCycleManager:
             reason = _classify_close_reason(level, stop_level, limit_level)
             print(f"Classified close reason for deal={pos_deal_id} as {reason}")
 
-            # mark event processed (avoid reprocessing)
             self._processed_close_events.add(ev["event_id"])
 
-            # persist close meta (even if not TP1/TP2)
             try:
                 set_trade_close_meta(
                     deal_id=pos_deal_id,
@@ -292,14 +290,12 @@ class TradeLifeCycleManager:
             if not group_id or tp_idx is None:
                 continue
 
-            # only react when closed by TP
             if reason != "TP":
                 logger.info(
                     f"[TradeLifeCycleManager] close event deal={pos_deal_id} tp_index={tp_idx} reason={reason} -> no SL ladder move"
                 )
                 continue
 
-            # We only implement ladder steps TP1 and TP2 (TP3 has no remaining trades).
             if tp_idx not in (1, 2):
                 logger.info(
                     f"[TradeLifeCycleManager] TP hit deal={pos_deal_id} tp_index={tp_idx} -> no further ladder action"
@@ -310,13 +306,7 @@ class TradeLifeCycleManager:
             if not remaining:
                 continue
 
-            # -------------------------
-            # Decide target SL level
-            # -------------------------
-            target_sl: Optional[float] = None
-
             if tp_idx == 1:
-                # TP1 -> move remaining to breakeven (entry +/- buffer individually)
                 logger.warning(
                     f"[TradeLifeCycleManager] TP1 hit (deal={pos_deal_id}) -> move SL to BE for "
                     f"{len(remaining)} remaining trades in group={group_id}"
@@ -331,11 +321,9 @@ class TradeLifeCycleManager:
                     take_profit = float(t.tp_price) if getattr(t, "tp_price", None) is not None else None
                     await broker_client.update_stop_loss(did, be_sl, take_profit)
                     self._last_sl_by_deal[did] = be_sl
-
-                continue  # done
+                continue
 
             if tp_idx == 2:
-                # TP2 -> move remaining (usually TP3) SL to TP1 price
                 tp1_trade = get_trade_in_group_by_tp_index(group_id, tp_index=1)
                 if not tp1_trade or getattr(tp1_trade, "tp_price", None) is None:
                     logger.warning(
@@ -353,14 +341,11 @@ class TradeLifeCycleManager:
                 for t in remaining:
                     did = t.deal_id
                     take_profit = float(t.tp_price) if getattr(t, "tp_price", None) is not None else None
-
                     await broker_client.update_stop_loss(did, tp1_price, take_profit)
                     self._last_sl_by_deal[did] = tp1_price
 
-
     async def _tick(self) -> None:
-        # Garbage Collector (race-safe):
-        # schließt NUR Gruppen, die >GC_GRACE_SECONDS alt sind UND komplett leer (0 Trades total)
+        # Garbage Collector
         stale_empty = get_stale_empty_trade_groups(grace_seconds=GC_GRACE_SECONDS)
         for gid in stale_empty:
             logger.warning(f"[TradeLifeCycleManager] repairing stale empty group={gid} -> CLOSED")
@@ -391,10 +376,7 @@ class TradeLifeCycleManager:
         if closed_ids:
             logger.info(f"[TradeLifeCycleManager] detected CLOSED deals: {sorted(closed_ids)}")
 
-            # mark closed in DB
             mark_trades_closed(closed_ids)
-
-            # NEW: now classify TP/SL and if TP1 hit, BE-move remaining
             await self._process_closed_deals_tp_hit(closed_ids)
 
             affected_groups = get_trade_group_ids_for_deals(closed_ids)
@@ -408,7 +390,13 @@ class TradeLifeCycleManager:
         if not normalized:
             return
 
-        price_cache: Dict[str, float] = {}
+        # ✅ GLOBAL RATE LIMIT COOLDOWN
+        now = time.time()
+        if now < self._rate_limited_until:
+            # don’t spam errors; just skip trailing updates until cooldown ends
+            remaining = int(self._rate_limited_until - now)
+            logger.warning(f"[TradeLifeCycleManager] IG rate-limited -> skip trailing updates for ~{remaining}s")
+            return
 
         for pos in normalized:
             deal_id = pos["deal_id"]
@@ -417,15 +405,45 @@ class TradeLifeCycleManager:
             entry = pos["entry_price"]
             take_profit = pos["take_profit"]
 
-            if symbol not in price_cache:
+            now = time.time()
+
+            # ✅ per-symbol cooldown (e.g. EDITS_ONLY / not-tradeable)
+            skip_until = self._symbol_skip_until.get(symbol, 0.0)
+            if now < skip_until:
+                continue
+
+            # ✅ cross-tick quote cache
+            cached = self._quote_cache.get(symbol)
+            if cached is not None:
+                cached_price, cached_ts = cached
+                if (now - cached_ts) <= QUOTE_TTL_SECONDS:
+                    current_price = cached_price
+                else:
+                    current_price = None
+            else:
+                current_price = None
+
+            # Fetch quote only if needed
+            if current_price is None:
                 try:
-                    price_cache[symbol] = await broker_client.get_current_price(symbol)
+                    current_price = await broker_client.get_current_price(symbol)
+                    self._quote_cache[symbol] = (float(current_price), now)
+                except ApiExceededException:
+                    # ✅ main fix: stop hammering IG, enter cooldown
+                    self._rate_limited_until = time.time() + RATE_LIMIT_COOLDOWN_SECONDS
+                    logger.warning(
+                        f"[TradeLifeCycleManager] IG ApiExceededException -> cooldown {RATE_LIMIT_COOLDOWN_SECONDS}s"
+                    )
+                    return  # stop this tick; prevent more calls
                 except MarketClosedError as e:
-                    # ✅ Minimal: skip trailing updates while market is closed
-                    logger.info(f"[TradeLifeCycleManager] skip SL update (no quote/market closed) symbol={symbol}: {e}")
+                    # ✅ treat EDITS_ONLY / missing bid/offer as "cooldown this symbol"
+                    self._symbol_skip_until[symbol] = time.time() + SYMBOL_COOLDOWN_SECONDS
+                    logger.info(
+                        f"[TradeLifeCycleManager] skip SL update (no quote/market closed) "
+                        f"symbol={symbol} (cooldown {SYMBOL_COOLDOWN_SECONDS}s): {e}"
+                    )
                     continue
 
-            current_price = price_cache.get(symbol)
             if current_price is None:
                 continue
 
@@ -438,8 +456,6 @@ class TradeLifeCycleManager:
             old_sl = pos["stop_loss"]
             last_set = self._last_sl_by_deal.get(deal_id)
             ref_sl = last_set if last_set is not None else old_sl
-
-            #logger.info(f"[TLM] deal={deal_id} entry={entry:.2f} old_sl={old_sl} new_sl={new_sl:.2f}")
 
             if ref_sl is None:
                 logger.info(
