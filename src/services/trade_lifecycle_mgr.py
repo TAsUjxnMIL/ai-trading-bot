@@ -55,14 +55,34 @@ def _opt_float(x: Any) -> Optional[float]:
 
 
 def _extract_position_fields(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Robust parsing for IG open positions.
+
+    Supports BOTH shapes:
+      (A) flat:
+          {dealId, epic, level, direction, stopLevel, limitLevel, ...}
+      (B) nested (common in trading-ig):
+          {
+            "position": {dealId, direction, level, stopLevel, limitLevel, ...},
+            "market": {epic, ...}
+          }
+
+    Returns normalized dict:
+      {
+        deal_id, symbol, side, entry_price, stop_loss, take_profit
+      }
+    """
     if not isinstance(pos, dict):
         return None
 
-    deal_id = pos.get("dealId")
-    symbol = pos.get("epic")
-    entry = pos.get("level")
+    p = pos.get("position") if isinstance(pos.get("position"), dict) else {}
+    m = pos.get("market") if isinstance(pos.get("market"), dict) else {}
 
-    direction = (pos.get("direction") or "").upper()
+    deal_id = pos.get("dealId") or p.get("dealId")
+    symbol = pos.get("epic") or m.get("epic")
+    entry = pos.get("level") if pos.get("level") is not None else p.get("level")
+
+    direction = (pos.get("direction") or p.get("direction") or "").upper()
     if direction == "BUY":
         side = "long"
     elif direction == "SELL":
@@ -70,8 +90,11 @@ def _extract_position_fields(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     else:
         return None
 
-    stop = _opt_float(pos.get("stopLevel"))
-    limit_level = _opt_float(pos.get("limitLevel"))
+    stop_raw = pos.get("stopLevel") if pos.get("stopLevel") is not None else p.get("stopLevel")
+    limit_raw = pos.get("limitLevel") if pos.get("limitLevel") is not None else p.get("limitLevel")
+
+    stop = _opt_float(stop_raw)
+    limit_level = _opt_float(limit_raw)
 
     if not deal_id or not symbol or entry is None:
         return None
@@ -224,7 +247,6 @@ class TradeLifeCycleManager:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # Only unexpected errors should land here now.
                 logger.exception(f"[TradeLifeCycleManager] loop error: {e}")
                 await asyncio.sleep(ERROR_BACKOFF)
 
@@ -253,7 +275,6 @@ class TradeLifeCycleManager:
                 continue
             if ev["event_id"] in self._processed_close_events:
                 continue
-
             closes_by_pos[ev["pos_deal_id"]] = ev
 
         for pos_deal_id in closed_ids:
@@ -393,7 +414,6 @@ class TradeLifeCycleManager:
         # ✅ GLOBAL RATE LIMIT COOLDOWN
         now = time.time()
         if now < self._rate_limited_until:
-            # don’t spam errors; just skip trailing updates until cooldown ends
             remaining = int(self._rate_limited_until - now)
             logger.warning(f"[TradeLifeCycleManager] IG rate-limited -> skip trailing updates for ~{remaining}s")
             return
@@ -429,14 +449,12 @@ class TradeLifeCycleManager:
                     current_price = await broker_client.get_current_price(symbol)
                     self._quote_cache[symbol] = (float(current_price), now)
                 except ApiExceededException:
-                    # ✅ main fix: stop hammering IG, enter cooldown
                     self._rate_limited_until = time.time() + RATE_LIMIT_COOLDOWN_SECONDS
                     logger.warning(
                         f"[TradeLifeCycleManager] IG ApiExceededException -> cooldown {RATE_LIMIT_COOLDOWN_SECONDS}s"
                     )
                     return  # stop this tick; prevent more calls
                 except MarketClosedError as e:
-                    # ✅ treat EDITS_ONLY / missing bid/offer as "cooldown this symbol"
                     self._symbol_skip_until[symbol] = time.time() + SYMBOL_COOLDOWN_SECONDS
                     logger.info(
                         f"[TradeLifeCycleManager] skip SL update (no quote/market closed) "

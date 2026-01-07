@@ -30,7 +30,7 @@ class IGClient:
       IG_SERVICE_ACC_NUMBER (optional)
     """
 
-    # ✅ NEW: deal meta cache TTL (seconds)
+    # ✅ deal meta cache TTL (seconds)
     DEAL_META_TTL_SECONDS = 60.0
 
     def __init__(
@@ -60,7 +60,7 @@ class IGClient:
 
         self._session_lock = threading.Lock()
 
-        # ✅ NEW: deal_id -> (epic, direction, ts_epoch)
+        # ✅ deal_id -> (epic, direction, ts_epoch)
         # direction here is POSITION direction from IG: "BUY" (long) or "SELL" (short)
         self._deal_meta_cache: Dict[str, Tuple[str, str, float]] = {}
 
@@ -218,7 +218,26 @@ class IGClient:
 
         return float(round(stop, 2))
 
-    # ✅ NEW: fetch epic+direction for a deal_id (with tiny TTL cache)
+    # ✅ Robust: read dealId/epic/direction from both flat and nested shapes
+    @staticmethod
+    def _row_get_deal_epic_direction(r: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        if not isinstance(r, dict):
+            return None, None, None
+
+        pos = r.get("position") or {}
+        mkt = r.get("market") or {}
+
+        deal_id = r.get("dealId") or pos.get("dealId")
+        epic = r.get("epic") or mkt.get("epic")
+        direction = r.get("direction") or pos.get("direction")
+
+        deal_id = str(deal_id) if deal_id is not None else None
+        epic = str(epic) if epic is not None else None
+        direction = (str(direction).upper()) if direction is not None else None
+
+        return deal_id, epic, direction
+
+    # ✅ fetch epic+direction for a deal_id (with tiny TTL cache)
     def _get_deal_meta(self, deal_id: str) -> Optional[Tuple[str, str]]:
         now = time.time()
         cached = self._deal_meta_cache.get(str(deal_id))
@@ -239,7 +258,6 @@ class IGClient:
             try:
                 rows = pos.to_dict(orient="records")
             except Exception:
-                # some shapes return dict-of-dicts
                 try:
                     d = pos.to_dict()
                     rows = list(d.values()) if isinstance(d, dict) else []
@@ -252,14 +270,19 @@ class IGClient:
         else:
             rows = []
 
-        # IG open positions rows usually include: dealId, epic, direction
-        found_epic = None
-        found_direction = None
+        found_epic: Optional[str] = None
+        found_direction: Optional[str] = None
+
         for r in rows:
-            if str(r.get("dealId")) == str(deal_id):
-                found_epic = r.get("epic")
-                found_direction = (r.get("direction") or "").upper()
-                break
+            did, epic, direction = self._row_get_deal_epic_direction(r)
+            if did is None:
+                continue
+            if str(did) != str(deal_id):
+                continue
+
+            found_epic = epic
+            found_direction = direction
+            break
 
         if not found_epic or found_direction not in ("BUY", "SELL"):
             return None
@@ -505,11 +528,9 @@ class IGClient:
             try:
                 clamped = self._clamp_stop_level(epic, direction, proposed)
             except MarketClosedError as e:
-                # If market snapshot isn't tradeable right now, best is: skip changing SL (caller may catch/log)
                 logger.info(f"[IG][UPDATE_SL] market closed while clamping deal_id={deal_id}: {e}")
                 raise
             except Exception as e:
-                # If clamp fails for any reason, fallback to proposed (don't block) but log clearly
                 logger.warning(f"[IG][UPDATE_SL] clamp failed deal_id={deal_id} proposed={proposed}: {e}")
                 clamped = proposed
 
@@ -517,7 +538,6 @@ class IGClient:
                 logger.warning(f"[IG][UPDATE_SL] CLAMP applied deal_id={deal_id}: {proposed} -> {clamped}")
             stop_level = clamped
         else:
-            # Can't resolve epic/direction (maybe already closed) -> just try update with proposed
             logger.warning(f"[IG][UPDATE_SL] no deal meta for deal_id={deal_id} -> update without clamp")
             stop_level = proposed
 
