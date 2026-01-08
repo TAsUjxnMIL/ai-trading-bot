@@ -35,7 +35,7 @@ GC_GRACE_SECONDS = 60
 ACTIVITY_LOOKBACK_MINUTES = 24 * 60  # 24h
 
 # classification tolerance (XAUUSD-ish)
-CLOSE_EPS = 0.15
+CLOSE_EPS = 0.5
 BREAKEVEN_BUFFER = 0.0  # move SL to entry +/- buffer
 
 # ✅ NEW: quote + request protection
