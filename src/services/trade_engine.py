@@ -32,7 +32,7 @@ STEP_DIST_POINTS: float = 5.0
 STEP_SIZE_POINTS: float = 1.0
 
 # Gesamtgröße pro Signal (TradeGroup)
-TOTAL_POSITION_SIZE: float = 1.2
+TOTAL_POSITION_SIZE: float = 0.6
 
 # Size-Regeln für dein GOLD-Instrument laut Log:
 # LIVE GOLD: minDealSize=0.125 (laut IG), sinnvolles step=0.025
